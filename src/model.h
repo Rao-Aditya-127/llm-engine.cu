@@ -30,6 +30,11 @@ public:
     const float* final_norm   = nullptr;  // [hidden]
     std::vector<LayerWeights> layers;
 
+    // Raw access to the contiguous weight blob — used by the GPU runner to
+    // upload everything at once, then rebase host pointers to device offsets.
+    const float* base() const { return buffer_.data(); }
+    size_t num_floats() const { return buffer_.size(); }
+
 private:
     std::vector<float> buffer_;  // owns all weight data
 };

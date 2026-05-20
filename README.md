@@ -29,8 +29,10 @@ greedy. Output verified token-exact against HuggingFace `transformers`.
 python tools/convert.py --out tinyllm.bin
 python tools/golden.py
 
-# build (primary: make + g++/nvcc)
+# build CPU engine (Phase 1)
 make
+# build GPU engine (Phase 2 — needs CUDA toolkit + NVIDIA GPU)
+make gpu
 
 # tokenize, run, de-tokenize
 python tools/tokenizer.py encode "The capital of France is"
@@ -47,7 +49,7 @@ python tools/tokenizer.py decode <ids...>
 
 - [x] Phase 0 — weight export + golden reference
 - [x] Phase 1 — CPU baseline (naive + OpenMP)
-- [ ] Phase 2 — GPU port, kernel by kernel
+- [~] Phase 2 — GPU port, kernel by kernel (code written; verify on GPU)
 - [ ] Phase 3 — FP16 + profiling
 - [ ] Phase 4 — INT8 weight quantization
 - [ ] Phase 5 — measure & document

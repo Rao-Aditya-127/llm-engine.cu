@@ -6,9 +6,18 @@
 #include <vector>
 
 #include "config.h"
-#include "infer_cpu.h"
 #include "model.h"
 #include "sampler.h"
+
+// USE_CUDA is defined by the `gpu` Makefile target. The two runners share an
+// identical interface, so the rest of main() is build-agnostic.
+#ifdef USE_CUDA
+#include "infer_gpu.h"
+using Runner = GpuRunner;
+#else
+#include "infer_cpu.h"
+using Runner = CpuRunner;
+#endif
 
 // CLI: tinyllm <model.bin> --ids "785 6722 ..." [--max-new N]
 //             [--temp T] [--top-p P] [--seed S] [--dump-logits PATH]
@@ -50,7 +59,7 @@ int main(int argc, char** argv) {
     if (prompt.empty()) { std::fprintf(stderr, "no --ids given\n"); return 1; }
 
     Model model(model_path);
-    CpuRunner runner(model);
+    Runner runner(model);
     int V = runner.vocab_size();
 
     // Prefill: process every prompt token; keep the logits after the last one.

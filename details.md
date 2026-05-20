@@ -300,7 +300,125 @@ If short on time: master the two ★ items. Attention + matmul *is* the model.
 
 ## Phase 2 — GPU port, kernel by kernel
 
-_Not started yet._
+**Goal:** Move the entire forward pass onto the GPU. Every CPU op from Phase 1
+gets a hand-written CUDA kernel — no cuBLAS, no CUTLASS. Still FP32.
+
+> **Status: code written, not yet verified.** This phase was authored on a
+> machine with no GPU. The code below must be compiled with `nvcc` and run on
+> the cloud Linux VM (T4) to clear Checkpoint 2. The CPU engine from Phase 1 is
+> the reference: the GPU output must match it.
+
+### Why this phase exists
+
+A GPU has thousands of cores. The CPU engine computes one matmul output row at a
+time (or a few, with OpenMP). The GPU computes thousands at once. But the GPU
+only helps if the *data movement* is right — and that is the real lesson here.
+Inference is **memory-bandwidth-bound**: each generated token must read every
+weight in the model exactly once, and does only a couple of FLOPs per weight.
+So the kernels are designed around *how memory is read*, not how math is done.
+
+### How the GPU build is structured
+
+- **`kernels/kernels.cuh`** — declares the host-side launch wrappers
+  (`rmsnorm_cuda`, `rope_cuda`, …) and a `CUDA_CHECK` macro that aborts on any
+  CUDA error. This is the contract between `infer.cu` and the kernels.
+- **`kernels/*.cu`** — one file per op. Each has a `__global__` kernel (runs on
+  the GPU) and a small host wrapper that picks the launch grid.
+- **`infer.cu`** — `GpuRunner`: same interface as `CpuRunner`. It uploads all
+  weights to the GPU once, owns the device KV cache, and runs the per-layer
+  sequence of kernel launches.
+- **`src/infer_gpu.h`** — `GpuRunner`'s header. Deliberately contains *no* CUDA
+  types (device pointers are plain `float*`), so `main.cpp` can include it
+  without needing the CUDA compiler.
+- **`main.cpp`** — one `#ifdef USE_CUDA` picks `GpuRunner` vs `CpuRunner`. The
+  `gpu` Makefile target defines `USE_CUDA` and builds with `nvcc`.
+
+### The kernels (ported easiest-to-hardest)
+
+#### `rmsnorm.cu`
+A **reduction** followed by an element-wise scale. One block handles the whole
+896-dim vector: each thread sums the squares of its slice, then a tree reduction
+in shared memory combines them into one sum-of-squares. The "tree reduction"
+(halve the active threads each step) is the fundamental GPU pattern for "combine
+N values into one" — worth understanding well.
+
+#### `rope.cu`
+Pure element-wise: one thread per `(head, pair)` index, each rotating one pair of
+numbers. No reduction, no shared memory — the easiest kind of kernel.
+
+#### `swiglu.cu`
+One thread per element, computing `silu(gate[i]) * up[i]`. **Fused**: the
+`silu(gate)` intermediate is never written to global memory — it lives in a
+register for the one instruction between computing it and multiplying. Writing
+it out and reading it back would cost two extra trips over the bandwidth bottleneck.
+
+#### `matmul.cu` — the important one
+For single-token decode this is a matrix-times-**vector** product. The design:
+**one warp (32 threads) per output row**. The 32 lanes stride across the input
+dimension so they read *consecutive* weights — a "coalesced" access, which is
+what lets the GPU read memory at full bandwidth. The 32 partial sums are then
+combined with a **warp-shuffle reduction** (`__shfl_down_sync`) — threads in a
+warp exchange registers directly, no shared memory needed.
+- *Why this matters:* five matmuls per layer × 24 layers — this kernel is where
+  almost all the time goes. Phase 3's profiling should confirm it.
+- *Known next step:* `float4` vectorized loads (read 4 weights per instruction).
+  Left as the Phase 2 stretch optimization.
+
+#### `attention.cu` — the hardest
+One block per query head. It does, in order: (1) score = dot(query, each cached
+key); (2) a block reduction for the max; (3) `exp` and a block reduction for the
+sum — that is the softmax; (4) the weighted sum of the cached values. GQA is
+handled by mapping query head `h` to key/value head `h / 7`. The scores live in
+shared memory. *Known next step:* a single-pass "flash-attention style" fused
+softmax that never materializes the full score array.
+
+### Two design choices worth noting
+
+- **K and V are written straight into the cache.** The `k`/`v` projection
+  matmuls write their output *directly* into this token's slot in the KV cache,
+  and RoPE rotates it in place. No separate buffer, no copy.
+- **Default CUDA stream = correct ordering for free.** Every kernel launches on
+  the default stream, so they run strictly one after another. Since each op
+  depends on the previous one's output, that is exactly the ordering we need —
+  no manual synchronization between kernels.
+
+### Checkpoint 2 — how to verify (on the VM)
+
+1. `make gpu` (needs CUDA toolkit + an NVIDIA GPU; `-arch=sm_75` is set for T4).
+2. `./build/tinyllm_gpu tinyllm.bin --ids "785 6722 315 9625 374" --max-new 32`
+3. The 32 output tokens must match `benchmarks/golden.txt` exactly (FP32 on GPU
+   should match FP32 on CPU to rounding noise — argmax identical).
+4. `--dump-logits` then diff against `golden_logits.bin`, same as Phase 1.
+5. Record GPU FP32 tok/s in the README table.
+
+If the output is wrong, bisect kernel by kernel: the GPU and CPU runners share
+the interface, so you can swap one GPU kernel at a time and compare.
+
+### Concepts to focus on (80/20)
+
+- ★ **Coalesced memory access.** The single most important GPU idea for this
+  project. When 32 neighboring threads read 32 neighboring addresses, the
+  hardware fetches it in one transaction at full bandwidth. Scattered reads waste
+  most of the bandwidth. This is *why* `matmul.cu` is laid out warp-per-row.
+- ★ **Memory-bandwidth-bound.** Decoding one token reads all ~0.5B weights once.
+  The math is trivial next to the reading. So "make it faster" = "read less / read
+  better", which is the whole point of Phases 3–4. (Resource: Horace He, "Making
+  Deep Learning Go Brrrr".)
+- **Thread / block / warp / grid.** A *thread* does scalar work; 32 threads form a
+  *warp* that executes in lockstep; threads group into *blocks* that share fast
+  shared memory; blocks form the *grid*. (Resource: PMPP book, early chapters.)
+- **Reductions.** Combining N values into one (a sum, a max) in parallel — the
+  tree reduction (shared memory) and the warp-shuffle reduction. Used in rmsnorm
+  and attention. Learn the pattern once; it recurs everywhere.
+- **Shared memory vs global memory.** Shared memory is small, per-block, and
+  ~100x faster than global. Kernels stage hot data there (the scores in
+  attention). Global memory is the big, slow space the weights live in.
+- **Kernel launch / `<<<blocks, threads>>>`.** How the host starts GPU work, and
+  why launches on one stream serialize. The grid dimensions are just "how many
+  threads, grouped how".
+
+If short on time: master the two ★ items. The rest of Phases 3–5 only makes
+sense once "it's bandwidth-bound, so read memory well" is second nature.
 
 ---
 
