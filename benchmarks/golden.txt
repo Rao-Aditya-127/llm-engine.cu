@@ -1,0 +1,11 @@
+prompt: The capital of France is
+prompt_ids: 785 6722 315 9625 374
+first_step_argmax: 12095
+first_step_top5:
+  12095	15.59818
+  32671	15.34059
+  2130	14.61205
+  65892	14.33902
+  1304	13.85626
+greedy_ids: 12095 13 1084 374 279 7772 3283 304 9625 323 279 2086 7772 304 4505 13 1084 374 279 6722 315 279 22843 5429 11 279 3146 594 2086 7772 3146 13
+greedy_text:  Paris. It is the largest city in France and the second largest in Europe. It is the capital of the Fifth Republic, the country's second largest country.

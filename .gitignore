@@ -1,0 +1,38 @@
+# Model weights & dumped tensors — large/regenerable binary artifacts
+# (recreate with tools/convert.py and tools/golden.py)
+tinyllm.bin
+*.bin
+
+# Build output
+build/
+*.exe
+*.obj
+*.o
+*.out
+
+# Profiler output (Phase 3+)
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# HuggingFace model cache (if it ever lands inside the repo)
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+#some generated files
+project_idea.md
+
+# Local Windows build script (hardcoded VS path, device-specific)
+tools/build_win.bat
