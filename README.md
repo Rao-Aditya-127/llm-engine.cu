@@ -1,4 +1,4 @@
-# TinyLLM
+# llm-engine.cu
 
 A single-GPU, raw C++/CUDA inference engine for **Qwen2-0.5B** — no cuBLAS, no
 CUTLASS. Every kernel is written by hand. The goal is to understand *why* LLM
@@ -13,14 +13,17 @@ it is built and why.
 Single-token decode throughput. Prompt: `"The capital of France is"`, 32 tokens,
 greedy. Output verified token-exact against HuggingFace `transformers`.
 
-| Phase | Engine            | Hardware          | tok/s |
-|-------|-------------------|-------------------|-------|
-| 1     | CPU naive (1 thr) | (dev machine)     | 1.91  |
-| 1     | CPU + OpenMP      | (dev machine)     | 8.69  |
-| 2     | GPU FP32          | T4                | TBD   |
-| 3     | GPU FP16          | T4                | TBD   |
-| 4     | GPU INT8 (W8A16)  | T4                | TBD   |
-| ref   | HF transformers   | T4                | TBD   |
+All rows below are measured on the same cloud GPU VM (lightning.ai) for an
+apples-to-apples comparison.
+
+| Phase | Engine            | Hardware          | tok/s  |
+|-------|-------------------|-------------------|--------|
+| 1     | CPU naive (1 thr) | VM CPU            | 1.60   |
+| 1     | CPU + OpenMP      | VM CPU            | 5.13   |
+| 2     | GPU FP32          | VM GPU            | 112.43 |
+| 3     | GPU FP16          | VM GPU            | TBD    |
+| 4     | GPU INT8 (W8A16)  | VM GPU            | TBD    |
+| ref   | HF transformers   | VM GPU            | TBD    |
 
 ## Usage
 
@@ -49,7 +52,7 @@ python tools/tokenizer.py decode <ids...>
 
 - [x] Phase 0 — weight export + golden reference
 - [x] Phase 1 — CPU baseline (naive + OpenMP)
-- [~] Phase 2 — GPU port, kernel by kernel (code written; verify on GPU)
+- [x] Phase 2 — GPU port, kernel by kernel
 - [ ] Phase 3 — FP16 + profiling
 - [ ] Phase 4 — INT8 weight quantization
 - [ ] Phase 5 — measure & document

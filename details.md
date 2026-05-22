@@ -247,10 +247,12 @@ read-only data. No locks, no races.
 
 ### Checkpoint 1 — result: PASSED
 
+Measured on the cloud GPU VM's CPU (same machine as all later phases):
+
 | Build       | tok/s | Notes                                  |
 |-------------|-------|----------------------------------------|
-| CPU naive   | 1.91  | single thread (compiler still vectorizes the inner loop) |
-| CPU OpenMP  | 8.69  | ~4.5x faster, all cores                |
+| CPU naive   | 1.60  | single thread (compiler still vectorizes the inner loop) |
+| CPU OpenMP  | 5.13  | ~3.2x faster, all cores                |
 
 - **Greedy output is token-exact** vs the golden reference — all 32 tokens match
   (` Paris. It is the largest city in France...`), for *both* the naive and
@@ -303,10 +305,9 @@ If short on time: master the two ★ items. Attention + matmul *is* the model.
 **Goal:** Move the entire forward pass onto the GPU. Every CPU op from Phase 1
 gets a hand-written CUDA kernel — no cuBLAS, no CUTLASS. Still FP32.
 
-> **Status: code written, not yet verified.** This phase was authored on a
-> machine with no GPU. The code below must be compiled with `nvcc` and run on
-> the cloud Linux VM (T4) to clear Checkpoint 2. The CPU engine from Phase 1 is
-> the reference: the GPU output must match it.
+> **Status: verified.** Authored on a machine with no GPU, then compiled with
+> `nvcc` and run on the cloud GPU VM — it compiled and produced correct output
+> on the first try. See "Checkpoint 2" below for the numbers.
 
 ### Why this phase exists
 
@@ -382,17 +383,26 @@ softmax that never materializes the full score array.
   depends on the previous one's output, that is exactly the ordering we need —
   no manual synchronization between kernels.
 
-### Checkpoint 2 — how to verify (on the VM)
+### Checkpoint 2 — result: PASSED
 
-1. `make gpu` (needs CUDA toolkit + an NVIDIA GPU; `-arch=sm_75` is set for T4).
-2. `./build/tinyllm_gpu tinyllm.bin --ids "785 6722 315 9625 374" --max-new 32`
-3. The 32 output tokens must match `benchmarks/golden.txt` exactly (FP32 on GPU
-   should match FP32 on CPU to rounding noise — argmax identical).
-4. `--dump-logits` then diff against `golden_logits.bin`, same as Phase 1.
-5. Record GPU FP32 tok/s in the README table.
+Built with `make gpu` and run on the cloud GPU VM:
 
-If the output is wrong, bisect kernel by kernel: the GPU and CPU runners share
-the interface, so you can swap one GPU kernel at a time and compare.
+| Engine        | Hardware | tok/s  |
+|---------------|----------|--------|
+| GPU FP32      | VM GPU   | 112.43 |
+| CPU + OpenMP  | VM CPU   | 5.13   |
+
+- **Greedy output token-exact** vs the golden reference — all 32 tokens match.
+- **First-step logits** match HuggingFace to a **max absolute difference of
+  1.6e-5** (even tighter than the CPU engine's 3.8e-5). Argmax `12095` identical.
+- **~22x faster** than the CPU+OpenMP build on the same VM — and this is still
+  the *naive* matmul (warp-per-row, no `float4`) in plain FP32. Phases 3–4 push
+  it further.
+
+To reproduce: `make gpu`, then run with `--dump-logits` and diff the dumped
+vector against `golden_logits.bin` with NumPy, exactly as in Phase 1. If output
+is ever wrong, bisect kernel by kernel — the GPU and CPU runners share an
+interface, so one GPU kernel can be swapped back to CPU at a time.
 
 ### Concepts to focus on (80/20)
 
