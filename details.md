@@ -320,15 +320,16 @@ So the kernels are designed around *how memory is read*, not how math is done.
 
 ### How the GPU build is structured
 
-- **`kernels/kernels.cuh`** — declares the host-side launch wrappers
-  (`rmsnorm_cuda`, `rope_cuda`, …) and a `CUDA_CHECK` macro that aborts on any
-  CUDA error. This is the contract between `infer.cu` and the kernels.
-- **`kernels/*.cu`** — one file per op. Each has a `__global__` kernel (runs on
+- **`kernels/fp32/kernels.cuh`** — declares the host-side launch wrappers
+  (`rmsnorm_cuda`, `rope_cuda`, …). The `CUDA_CHECK` macro lives in
+  `kernels/common.cuh` and is shared with the FP16 build. This header is the
+  contract between `src/infer_gpu_fp32.cu` and the FP32 kernels.
+- **`kernels/fp32/*.cu`** — one file per op. Each has a `__global__` kernel (runs on
   the GPU) and a small host wrapper that picks the launch grid.
-- **`infer.cu`** — `GpuRunner`: same interface as `CpuRunner`. It uploads all
-  weights to the GPU once, owns the device KV cache, and runs the per-layer
-  sequence of kernel launches.
-- **`src/infer_gpu.h`** — `GpuRunner`'s header. Deliberately contains *no* CUDA
+- **`src/infer_gpu_fp32.cu`** — `GpuRunner`: same interface as `CpuRunner`. It
+  uploads all weights to the GPU once, owns the device KV cache, and runs the
+  per-layer sequence of kernel launches.
+- **`src/infer_gpu_fp32.h`** — `GpuRunner`'s header. Deliberately contains *no* CUDA
   types (device pointers are plain `float*`), so `main.cpp` can include it
   without needing the CUDA compiler.
 - **`main.cpp`** — one `#ifdef USE_CUDA` picks `GpuRunner` vs `CpuRunner`. The
@@ -434,7 +435,146 @@ sense once "it's bandwidth-bound, so read memory well" is second nature.
 
 ## Phase 3 — FP16 + profiling
 
-_Not started yet._
+**Goal:** Switch the GPU engine to **FP16** weights and activations. This halves
+the bytes the GPU must read per token. Since inference is bandwidth-bound,
+roughly *halving the bytes ≈ doubling the speed.* Then profile with `nsys` and
+`ncu` to **prove** which kernel is the bottleneck.
+
+> **Status: code written, not yet verified.** Authored on a machine with no GPU;
+> compile and verify on the cloud GPU VM. The FP32 Phase 2 engine stays intact —
+> they're separate binaries so you can A/B them.
+
+### Why FP16 at all
+
+FP16 (half precision, 2 bytes per number) vs FP32 (4 bytes). Same model, half
+the storage. Two consequences:
+1. **`tinyllm_fp16.bin` ≈ 990 MB** (was 1.98 GB).
+2. Per generated token, the GPU reads ~990 MB of weights instead of ~1.98 GB.
+   At the same bandwidth, this is roughly **2x throughput**.
+
+We could lose accuracy — FP16 has fewer significant digits than FP32. The
+**standard trick** is **FP32 accumulation**: read weights and activations as
+FP16, but compute the matmul's dot product, the RMSNorm's sum-of-squares, and
+the softmax in FP32. Cast back to FP16 only when writing the result. This keeps
+the math accurate while still getting the bandwidth win.
+
+### What was built
+
+#### `tools/convert.py` — new `--dtype fp16`
+Emits weights as `numpy.float16` and writes `dtype=1` in the header. The
+forward-pass-order tensor layout is unchanged — only the element size shrinks.
+
+#### `src/model.h` / `src/model.cpp` — dtype-aware loader
+The header carries a `dtype` flag (0 = fp32, 1 = fp16). `model.cpp` now branches
+on it: an FP32 file populates `embed_tokens` / `layers` / `final_norm` (the
+existing fields), an FP16 file populates parallel `*_h` fields (`LayerWeightsHalf`)
+whose pointers are `const uint16_t*`. The CPU build never sees `__half`, so the
+header stays plain C++; the GPU code `reinterpret_cast`s `uint16_t*` to `__half*`
+on the device side. Each runner's constructor now also `throws` if you hand it a
+.bin of the wrong dtype, so mistakes fail loudly rather than producing garbage.
+
+#### `kernels/fp16/*.cu` — five new kernels
+Same structure as the FP32 ones, but every kernel:
+- Reads inputs as `__half` (via `__half2float`).
+- Accumulates in **FP32** (matmul dot products, RMSNorm sum-of-squares, softmax).
+- Writes results back as `__half` (via `__float2half`).
+
+One extra variant — **`matmul_fp16_to_fp32_cuda`** — handles the LM head: it
+multiplies FP16 weights × FP16 activations but writes **FP32 logits**, so the
+sampler can keep using the same `const float*` interface.
+
+#### `src/infer_gpu_fp16.cu` + `src/infer_gpu_fp16.h` — `GpuRunnerFP16`
+Identical structure to `GpuRunner` but every device buffer is FP16 (KV cache,
+activations, weights). The LM head writes FP32 directly into `d_logits_`. The
+class exposes the same `forward(int, int) -> const float*` interface, so
+`main.cpp` doesn't change shape.
+
+#### `src/main.cpp` — three-way build switch
+```cpp
+#if defined(USE_CUDA_FP16)   using Runner = GpuRunnerFP16;
+#elif defined(USE_CUDA)      using Runner = GpuRunner;
+#else                        using Runner = CpuRunner;
+```
+The Makefile picks one via `-DUSE_CUDA_FP16` / `-DUSE_CUDA` / nothing.
+
+#### `Makefile` — new `gpu_fp16` target
+Compiles `src/infer_gpu_fp16.cu` + the FP16 kernels + the shared `.cpp` files into
+`build/tinyllm_gpu_fp16`.
+
+### Checkpoint 3 — how to verify (on the VM)
+
+```
+# 1. Export an FP16 model
+python tools/convert.py --out tinyllm_fp16.bin --dtype fp16
+
+# 2. Build the FP16 binary
+make gpu_fp16
+
+# 3. Run and verify
+./build/tinyllm_gpu_fp16 tinyllm_fp16.bin \
+    --ids "785 6722 315 9625 374" --max-new 32 \
+    --dump-logits benchmarks/fp16_logits.bin
+```
+
+**Expected:**
+- The 32 output tokens match `benchmarks/golden.txt` exactly. FP16 has enough
+  precision that **argmax is unchanged**.
+- Numeric logit diff against the golden is **larger** than FP32 — expect
+  somewhere around `1e-2`–`1e-1` max abs diff (vs `1.6e-5` for FP32). That's
+  expected and healthy; what matters is the argmax.
+- tok/s should be **~2x the FP32 number** (so ~200+ on the same VM GPU).
+
+### Profiling (the second half of the phase)
+
+The Phase 3 question to answer with profilers: *"is the matmul kernel actually
+the bottleneck, like memory-bandwidth theory predicts?"*
+
+#### Nsight Systems — kernel timeline
+```
+nsys profile --stats=true \
+    -o benchmarks/fp16_nsys \
+    ./build/tinyllm_gpu_fp16 tinyllm_fp16.bin \
+        --ids "785 6722 315 9625 374" --max-new 32
+```
+The summary table at the end of the run tells you which kernel ate the most
+total time. Expect `matmul_fp16_kernel` to be ~70–90% of GPU time.
+
+#### Nsight Compute — per-kernel detail
+```
+ncu --set basic --target-processes all \
+    --kernel-name matmul_fp16_kernel --launch-count 20 \
+    -o benchmarks/fp16_matmul_ncu \
+    ./build/tinyllm_gpu_fp16 tinyllm_fp16.bin \
+        --ids "785 6722 315 9625 374" --max-new 4
+```
+The key number is **"Memory Throughput" / "Mem Busy"** — on a memory-bound
+kernel like this matmul, that should be a large fraction of the GPU's peak
+DRAM bandwidth (T4 ≈ 320 GB/s). If it's already near peak, the kernel is
+*memory-bound* — confirming the theory and pointing the way to Phase 4 (read
+even fewer bytes by using INT8).
+
+Save the `.nsys-rep` and `.ncu-rep` files into `benchmarks/`. They are the
+"evidence" half of the Phase 5 roofline write-up.
+
+### Concepts to focus on (80/20)
+
+- ★ **FP16 doesn't change correctness; it changes how many bytes you read.**
+  This is the whole reason for the phase. Same model, same math, half the
+  bandwidth.
+- ★ **Mixed-precision pattern: FP16 storage + FP32 accumulation.** Universal
+  in modern LLM inference. The places that *must* stay FP32: matmul dot-product
+  accumulator, softmax (max + sum), RMSNorm's sum-of-squares.
+- **Bandwidth-bound vs compute-bound.** Roughly: bandwidth-bound = your time
+  goes into reading memory, compute-bound = your time goes into doing math.
+  Single-token LLM decode is firmly bandwidth-bound. (Resource: Horace He.)
+- **Roofline model.** A graph: arithmetic intensity (FLOPs per byte read) on the
+  x-axis, achievable throughput on the y-axis. A "roof" of memory bandwidth
+  caps low-intensity kernels; a "roof" of peak FLOPs caps high-intensity ones.
+  Our matmul sits firmly under the memory roof. (Resource: any roofline tutorial;
+  PMPP discusses this.)
+- **`nsys` (timeline, big picture) vs `ncu` (per-kernel, deep dive).** Use nsys
+  first to find *which* kernel dominates, then ncu on that kernel to find out
+  *why*.
 
 ---
 

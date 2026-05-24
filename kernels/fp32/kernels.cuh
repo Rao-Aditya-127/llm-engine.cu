@@ -1,18 +1,5 @@
 #pragma once
-#include <cstdio>
-#include <cstdlib>
-#include <cuda_runtime.h>
-
-// Abort on any CUDA error, printing where it happened.
-#define CUDA_CHECK(call)                                                      \
-    do {                                                                      \
-        cudaError_t err__ = (call);                                           \
-        if (err__ != cudaSuccess) {                                           \
-            std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__,          \
-                         __LINE__, cudaGetErrorString(err__));                \
-            std::exit(1);                                                     \
-        }                                                                     \
-    } while (0)
+#include "common.cuh"
 
 // Host-side launch wrappers. Each runs on FP32 device buffers.
 // These are the Phase 2 ports of the CPU ops in src/infer_cpu.cpp.

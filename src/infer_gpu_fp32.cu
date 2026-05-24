@@ -1,6 +1,7 @@
-#include "infer_gpu.h"
-#include "kernels.cuh"
+#include "infer_gpu_fp32.h"
+#include "fp32/kernels.cuh"
 #include "config.h"
+#include <stdexcept>
 
 using namespace qwen2;
 
@@ -18,6 +19,8 @@ static void residual_add(float* x, const float* y, int n) {
 // ---------------------------------------------------------------------------
 
 GpuRunner::GpuRunner(const Model& model) {
+    if (model.header.dtype != 0)
+        throw std::runtime_error("GpuRunner expects an fp32 .bin (dtype=0)");
     header_ = model.header;
     vocab_  = header_.vocab_size;
 

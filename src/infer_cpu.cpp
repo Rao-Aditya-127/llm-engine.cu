@@ -1,6 +1,7 @@
 #include "infer_cpu.h"
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 using namespace qwen2;
 
@@ -50,6 +51,8 @@ static inline float silu(float z) { return z / (1.0f + std::exp(-z)); }
 // -------- runner ---------------------------------------------------------
 
 CpuRunner::CpuRunner(const Model& model) : model_(model) {
+    if (model.header.dtype != 0)
+        throw std::runtime_error("CpuRunner expects an fp32 .bin (dtype=0)");
     const auto& h = model_.header;
     int H = h.hidden_size, I = h.intermediate_size;
     int QD = h.num_heads * h.head_dim, KV = h.num_kv_heads * h.head_dim;

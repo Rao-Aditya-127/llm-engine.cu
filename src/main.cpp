@@ -9,10 +9,13 @@
 #include "model.h"
 #include "sampler.h"
 
-// USE_CUDA is defined by the `gpu` Makefile target. The two runners share an
-// identical interface, so the rest of main() is build-agnostic.
-#ifdef USE_CUDA
-#include "infer_gpu.h"
+// The three runners share an identical interface, so the rest of main() is
+// build-agnostic. The Makefile picks one with -DUSE_CUDA / -DUSE_CUDA_FP16.
+#if defined(USE_CUDA_FP16)
+#include "infer_gpu_fp16.h"
+using Runner = GpuRunnerFP16;
+#elif defined(USE_CUDA)
+#include "infer_gpu_fp32.h"
 using Runner = GpuRunner;
 #else
 #include "infer_cpu.h"

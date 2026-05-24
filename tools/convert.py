@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Export Qwen2-0.5B weights to tinyllm.bin.
 
-Phase 0: FP32 only. FP16 / INT8 export will be added in Phases 3 / 4.
+Phase 0 supports FP32 (--dtype fp32) and Phase 3 adds FP16 (--dtype fp16).
+INT8 export is added in Phase 4.
 
 File layout (little-endian):
 
@@ -28,6 +29,7 @@ import argparse
 import struct
 import sys
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -36,17 +38,22 @@ MAGIC = 0x4D4C4E54
 VERSION = 1
 HEADER_FMT = "<10I2f"  # magic,version,dtype,hidden,inter,layers,heads,kv_heads,head_dim,vocab, eps,theta
 
+DTYPE_FP32 = 0
+DTYPE_FP16 = 1
 
-def write_tensor(f, t):
+
+def write_tensor(f, t, dtype):
     arr = t.detach().to(torch.float32).contiguous().cpu().numpy()
+    if dtype == "fp16":
+        arr = arr.astype(np.float16)
     f.write(arr.tobytes())
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="tinyllm.bin")
-    ap.add_argument("--dtype", default="fp32", choices=["fp32"],
-                    help="fp16/int8 added in later phases")
+    ap.add_argument("--dtype", default="fp32", choices=["fp32", "fp16"],
+                    help="weight precision; fp16 halves file size and GPU bandwidth")
     args = ap.parse_args()
 
     print(f"loading {MODEL_ID} ...", file=sys.stderr)
@@ -69,30 +76,31 @@ def main():
           f"kv={nkv} head_dim={head_dim} vocab={vocab} eps={eps} theta={theta}",
           file=sys.stderr)
 
+    dtype_id = DTYPE_FP16 if args.dtype == "fp16" else DTYPE_FP32
     with open(args.out, "wb") as f:
-        f.write(struct.pack(HEADER_FMT, MAGIC, VERSION, 0, hidden, inter,
+        f.write(struct.pack(HEADER_FMT, MAGIC, VERSION, dtype_id, hidden, inter,
                             nlayers, nheads, nkv, head_dim, vocab, eps, theta))
 
-        write_tensor(f, sd["model.embed_tokens.weight"])
+        write_tensor(f, sd["model.embed_tokens.weight"], args.dtype)
 
         for i in range(nlayers):
             p = f"model.layers.{i}."
-            write_tensor(f, sd[p + "input_layernorm.weight"])
-            write_tensor(f, sd[p + "self_attn.q_proj.weight"])
-            write_tensor(f, sd[p + "self_attn.q_proj.bias"])
-            write_tensor(f, sd[p + "self_attn.k_proj.weight"])
-            write_tensor(f, sd[p + "self_attn.k_proj.bias"])
-            write_tensor(f, sd[p + "self_attn.v_proj.weight"])
-            write_tensor(f, sd[p + "self_attn.v_proj.bias"])
-            write_tensor(f, sd[p + "self_attn.o_proj.weight"])
-            write_tensor(f, sd[p + "post_attention_layernorm.weight"])
-            write_tensor(f, sd[p + "mlp.gate_proj.weight"])
-            write_tensor(f, sd[p + "mlp.up_proj.weight"])
-            write_tensor(f, sd[p + "mlp.down_proj.weight"])
+            write_tensor(f, sd[p + "input_layernorm.weight"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.q_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.q_proj.bias"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.k_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.k_proj.bias"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.v_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.v_proj.bias"], args.dtype)
+            write_tensor(f, sd[p + "self_attn.o_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "post_attention_layernorm.weight"], args.dtype)
+            write_tensor(f, sd[p + "mlp.gate_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "mlp.up_proj.weight"], args.dtype)
+            write_tensor(f, sd[p + "mlp.down_proj.weight"], args.dtype)
 
-        write_tensor(f, sd["model.norm.weight"])
+        write_tensor(f, sd["model.norm.weight"], args.dtype)
 
-    print(f"wrote {args.out}", file=sys.stderr)
+    print(f"wrote {args.out} ({args.dtype})", file=sys.stderr)
 
 
 if __name__ == "__main__":

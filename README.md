@@ -34,8 +34,11 @@ python tools/golden.py
 
 # build CPU engine (Phase 1)
 make
-# build GPU engine (Phase 2 — needs CUDA toolkit + NVIDIA GPU)
+# build GPU FP32 engine (Phase 2 — needs CUDA toolkit + NVIDIA GPU)
 make gpu
+# build GPU FP16 engine (Phase 3 — needs an extra `--dtype fp16` export)
+python tools/convert.py --out tinyllm_fp16.bin --dtype fp16
+make gpu_fp16
 
 # tokenize, run, de-tokenize
 python tools/tokenizer.py encode "The capital of France is"
@@ -53,6 +56,6 @@ python tools/tokenizer.py decode <ids...>
 - [x] Phase 0 — weight export + golden reference
 - [x] Phase 1 — CPU baseline (naive + OpenMP)
 - [x] Phase 2 — GPU port, kernel by kernel
-- [ ] Phase 3 — FP16 + profiling
+- [~] Phase 3 — FP16 + profiling (code written; verify + profile on GPU)
 - [ ] Phase 4 — INT8 weight quantization
 - [ ] Phase 5 — measure & document
