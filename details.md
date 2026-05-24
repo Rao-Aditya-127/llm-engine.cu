@@ -440,9 +440,8 @@ the bytes the GPU must read per token. Since inference is bandwidth-bound,
 roughly *halving the bytes ≈ doubling the speed.* Then profile with `nsys` and
 `ncu` to **prove** which kernel is the bottleneck.
 
-> **Status: code written, not yet verified.** Authored on a machine with no GPU;
-> compile and verify on the cloud GPU VM. The FP32 Phase 2 engine stays intact —
-> they're separate binaries so you can A/B them.
+> **Status: verified.** Built with `make gpu_fp16` and run on the VM —
+> compiled and produced token-exact output on the first try.
 
 ### Why FP16 at all
 
@@ -501,7 +500,64 @@ The Makefile picks one via `-DUSE_CUDA_FP16` / `-DUSE_CUDA` / nothing.
 Compiles `src/infer_gpu_fp16.cu` + the FP16 kernels + the shared `.cpp` files into
 `build/tinyllm_gpu_fp16`.
 
-### Checkpoint 3 — how to verify (on the VM)
+### Checkpoint 3 — result: PASSED
+
+| Engine        | Hardware | tok/s  |
+|---------------|----------|--------|
+| GPU FP16      | VM GPU   | 184.66 |
+| GPU FP32      | VM GPU   | 112.43 |
+
+- **Greedy output token-exact** vs the golden reference — all 32 tokens match.
+- **First-step logits** vs HuggingFace: argmax `12095` identical; max abs diff
+  `0.032`, mean abs diff `0.0048`. That's ~2000× looser than the FP32 engine
+  (which was `1.6e-5`), exactly as expected — FP16 has fewer significant
+  digits — and the argmax / token sequence are unchanged, which is what
+  decoding correctness actually depends on.
+- **~1.6× faster** than the FP32 build on the same VM GPU. Not the full 2×
+  bandwidth-halving win because non-matmul kernels (RMSNorm reductions,
+  attention softmax) carry FP32 work that didn't shrink, and per-step
+  kernel-launch overhead is fixed. The matmul itself is where the win lives —
+  Phase 4 (INT8) doubles down on the same lever.
+
+### Profiling — kernel dominance (Nsight Compute, `--metrics gpu__time_duration.sum`)
+
+Profiled 2,533 launches across 7 forward passes on the same VM GPU:
+
+| Kernel | Calls | Time | % of GPU time |
+|---|---:|---:|---:|
+| `matmul_fp16_kernel` (Q/K/V/O/gate/up/down across 24 layers) | 1,176 | 28.6 ms | **62.1%** |
+| `matmul_fp16_to_fp32_kernel` (LM head, FP32 logits) | 7 | 8.1 ms | **17.6%** |
+| `rmsnorm_fp16_kernel` | 343 | 3.4 ms | 7.3% |
+| `attention_fp16_kernel` | 168 | 2.2 ms | 4.7% |
+| `rope_fp16_kernel` | 336 | 1.9 ms | 4.2% |
+| `residual_add_fp16_kernel` | 336 | 1.2 ms | 2.6% |
+| `swiglu_fp16_kernel` | 168 | 0.65 ms | 1.4% |
+
+Combined matmul work is **~80% of all GPU time** — confirming the bandwidth-bound
+theory. The LM head deserves its own row: it is a single matmul of size
+`[151,936 × 896]` per token, ~260 MB of FP16 weights read per forward, so it
+costs roughly the same as ~7 ordinary layer matmuls combined.
+
+### Profiling — bandwidth utilization on the dominant matmul (Speed of Light)
+
+`ncu --set basic --kernel-name matmul_fp16_kernel` across launches of different
+shapes:
+
+| Launch | Grid | n_out | Op | Memory % of peak | Compute % of peak |
+|---|---|---:|---|---:|---:|
+| big | 608 | 4864 | gate / up / down | **90.5%** | 61.7% |
+| medium | 112 | 896 | Q / O | 57.7% | 39.0% |
+| small | 16 | 128 | K / V | 15.6% | 8.6% |
+
+The big FFN matmuls hit **~290 GB/s** out of T4's ~320 GB/s peak DRAM bandwidth.
+**There is no more bandwidth left at FP16 for that kernel** — the only path
+forward on bandwidth is *reading fewer bytes per weight*, which is Phase 4 (INT8).
+
+The small K/V projections (15–17% bandwidth) waste the GPU not because of
+memory, but because they only spawn 16 blocks on a 40-SM GPU — known optimization
+("fused QKV") for later.
+
+### How to reproduce
 
 ```
 # 1. Export an FP16 model

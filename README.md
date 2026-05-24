@@ -21,7 +21,7 @@ apples-to-apples comparison.
 | 1     | CPU naive (1 thr) | VM CPU            | 1.60   |
 | 1     | CPU + OpenMP      | VM CPU            | 5.13   |
 | 2     | GPU FP32          | VM GPU            | 112.43 |
-| 3     | GPU FP16          | VM GPU            | TBD    |
+| 3     | GPU FP16          | VM GPU            | 184.66 |
 | 4     | GPU INT8 (W8A16)  | VM GPU            | TBD    |
 | ref   | HF transformers   | VM GPU            | TBD    |
 
@@ -56,6 +56,6 @@ python tools/tokenizer.py decode <ids...>
 - [x] Phase 0 — weight export + golden reference
 - [x] Phase 1 — CPU baseline (naive + OpenMP)
 - [x] Phase 2 — GPU port, kernel by kernel
-- [~] Phase 3 — FP16 + profiling (code written; verify + profile on GPU)
+- [x] Phase 3 — FP16 + profiling
 - [ ] Phase 4 — INT8 weight quantization
 - [ ] Phase 5 — measure & document
