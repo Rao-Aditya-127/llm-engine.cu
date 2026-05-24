@@ -634,9 +634,145 @@ Save the `.nsys-rep` and `.ncu-rep` files into `benchmarks/`. They are the
 
 ---
 
-## Phase 4 — INT8 weight quantization
+## Phase 4 — INT8 weight quantization (W8A16)
 
-_Not started yet._
+**Goal:** Halve the byte count of every weight read *again*, on top of FP16.
+Profiling proved the matmul is bandwidth-bound at 90% of T4's DRAM peak — there
+is no more bandwidth headroom at FP16. The only way forward is to **read fewer
+bytes per weight**: INT8 (1 byte) instead of FP16 (2 bytes).
+
+> **Status: code written, not yet verified.** Authored on a machine with no GPU;
+> compile and verify on the cloud GPU VM. Earlier FP32/FP16 binaries are
+> untouched so all three can be benchmarked side by side.
+
+### Why W8A16, not full INT8
+
+The name **W8A16** = INT8 **W**eights, FP16 **A**ctivations. We quantize only
+the weights — activations, KV cache, accumulators stay floating-point.
+
+The reason: weights are **read every token** (~0.5 GB per token), but activations
+are **tiny** (a few KB per layer). Quantizing weights buys all the bandwidth win;
+quantizing activations buys almost nothing and costs a lot of accuracy.
+
+### The quantization scheme
+
+**Symmetric, per-output-row, INT8.** For each output row of a matmul weight
+`W[i, :]`:
+```
+  scale[i]  = max(|W[i, :]|) / 127     (one FP16 number per row)
+  W_q[i, j] = round(W[i, j] / scale[i])   (clipped to [-127, 127])
+```
+Dequantization: `W[i, j] ≈ W_q[i, j] * scale[i]`.
+
+**Per-row** matters. A single scale for the whole matrix would lose too much
+precision (some rows have much bigger weights than others). Per-row gives every
+row its own dynamic range while only adding `n_out` fp16 scales (a rounding
+error in file size).
+
+### What was built
+
+#### `tools/convert.py` — `--dtype int8`
+For each matmul weight (Q/K/V/O/gate/up/down + the tied embedding), runs the
+quant above and writes `int8 bytes` followed by `fp16 scales`. Biases and
+RMSNorm weights stay FP16 (they're small and numerically sensitive).
+`tinyllm_int8.bin` ≈ **500 MB** (½ the FP16 file, ¼ the FP32 file).
+
+#### `src/model.h` / `src/model.cpp` — INT8 loader
+A new `LayerWeightsInt8` struct holds the heterogeneous pointers
+(`const int8_t*` for weights, `const uint16_t*` for scales/biases/norms). The
+loader for `dtype == 2` reads the whole file as bytes into `buffer_q_` and
+walks it with byte offsets, casting to the right pointer type as it goes. The
+loader is the *only* place that knows the byte layout.
+
+#### `kernels/int8/matmul.cu` — fused dequant + matmul (THE key kernel)
+Same warp-per-row skeleton as the FP16 matmul. The single new line is:
+```cuda
+acc += (float)w_int8[i] * __half2float(x[i]);     // int8 -> float in-register
+...
+y[warp] = __float2half(acc * scale[warp] + bias); // one multiply at the end
+```
+The **per-row scale is constant within a warp** so it factors *out* of the
+inner loop — applied exactly once after the reduction. That's the trick that
+makes W8A16 nearly free over a pure FP16 matmul: same arithmetic count, one
+extra FMA per output, half the bytes read.
+
+A variant `matmul_int8_to_fp32_kernel` is used for the LM head (writes FP32
+logits, no bias).
+
+#### `kernels/int8/embedding.cu`
+The FP16 runner could just `cudaMemcpy` an embedding row. The INT8 runner
+can't — the row is INT8 + a per-row scale. A tiny kernel reads
+`(int8, scale)` and writes FP16 to the working hidden vector `d_x_`.
+
+#### `src/infer_gpu_int8.{h,cu}` — `GpuRunnerInt8`
+Same orchestration as `GpuRunnerFP16` but calls `matmul_int8_cuda` everywhere
+and starts with `embed_dequant_int8_cuda` instead of a memcpy. Reuses the FP16
+RMSNorm / RoPE / SwiGLU / attention kernels untouched (activations are still
+FP16 — only the **weights** changed precision).
+
+#### `src/main.cpp` — four-way build switch
+```cpp
+#if   defined(USE_CUDA_INT8)  using Runner = GpuRunnerInt8;
+#elif defined(USE_CUDA_FP16)  using Runner = GpuRunnerFP16;
+#elif defined(USE_CUDA)       using Runner = GpuRunner;
+#else                         using Runner = CpuRunner;
+```
+
+#### `Makefile` — new `gpu_int8` target
+Compiles `infer_gpu_int8.cu` + the two INT8 kernels + the four reused FP16
+kernels + the shared `.cpp` files into `build/tinyllm_gpu_int8`.
+
+### Checkpoint 4 — how to verify (on the VM)
+
+```bash
+# 1. Export an INT8 model (~500 MB)
+python tools/convert.py --out tinyllm_int8.bin --dtype int8
+
+# 2. Build
+make gpu_int8
+
+# 3. Run + dump logits
+./build/tinyllm_gpu_int8 tinyllm_int8.bin \
+    --ids "785 6722 315 9625 374" --max-new 32 \
+    --dump-logits benchmarks/int8_logits.bin
+
+# 4. Numerically diff vs golden
+python3 -c "
+import numpy as np
+g=np.fromfile('benchmarks/golden_logits.bin',dtype=np.float32)
+p=np.fromfile('benchmarks/int8_logits.bin',dtype=np.float32)
+print('argmax g/p:', int(g.argmax()), int(p.argmax()))
+print('max abs diff:', float(np.abs(g-p).max()))
+print('mean abs diff:', float(np.abs(g-p).mean()))
+"
+```
+
+**Expected:**
+- The 32 output tokens **should match** the golden continuation. INT8 with
+  per-row scales is precise enough that argmax usually agrees. A token or two
+  *might* diverge late in the sequence — that's acceptable for INT8.
+- Logit max abs diff will be **bigger than FP16** — expect somewhere around
+  `0.1–0.5`. Mean abs diff `~0.01–0.05`. argmax should match.
+- tok/s should be **~1.5–2x the FP16 number** (~280–370 on the VM GPU).
+
+### Concepts to focus on (80/20)
+
+- ★ **Per-channel symmetric quantization.** One scale per output row. INT8
+  weight `w_q[i,j]` represents `w_q[i,j] * scale[i]`. This is the foundational
+  scheme — GPTQ, AWQ, bitsandbytes, GGUF Q8 all start here and add tricks.
+- ★ **Fused dequant + matmul.** Never materialize an FP16 weight tensor. Read
+  INT8 from global memory, dequantize in registers inside the matmul loop.
+  This is what makes weight-only quantization practical — without fusion you'd
+  spend the bandwidth win on writing dequantized weights to memory.
+- **W8A16 vs W8A8 vs INT4.** W8A16 (us) quantizes weights only. W8A8 also
+  quantizes activations (more bandwidth on KV cache, harder accuracy).
+  INT4 is the modern default — twice as compressed, same skeleton, plus
+  bit-packing two weights per byte. Same code shape, just slightly more
+  arithmetic at the boundary.
+- **Why the LM head dominated less in our profile than the FFN matmuls.** The
+  FFN matmul is `[4864 × 896]` weights × 24 layers = much more total bytes
+  than the LM head's `[151,936 × 896]`. INT8 helps both proportionally; the
+  largest gain is on the largest matmul.
 
 ---
 

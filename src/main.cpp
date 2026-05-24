@@ -9,9 +9,13 @@
 #include "model.h"
 #include "sampler.h"
 
-// The three runners share an identical interface, so the rest of main() is
-// build-agnostic. The Makefile picks one with -DUSE_CUDA / -DUSE_CUDA_FP16.
-#if defined(USE_CUDA_FP16)
+// The four runners share an identical interface, so the rest of main() is
+// build-agnostic. The Makefile picks one with -DUSE_CUDA_INT8 /
+// -DUSE_CUDA_FP16 / -DUSE_CUDA / nothing.
+#if defined(USE_CUDA_INT8)
+#include "infer_gpu_int8.h"
+using Runner = GpuRunnerInt8;
+#elif defined(USE_CUDA_FP16)
 #include "infer_gpu_fp16.h"
 using Runner = GpuRunnerFP16;
 #elif defined(USE_CUDA)

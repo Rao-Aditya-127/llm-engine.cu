@@ -2,6 +2,7 @@
 #   make        / make cpu  -> Phase 1 CPU binaries (g++)
 #   make gpu                -> Phase 2 CUDA FP32 binary (nvcc, needs an NVIDIA GPU)
 #   make gpu_fp16           -> Phase 3 CUDA FP16 binary
+#   make gpu_int8           -> Phase 4 CUDA INT8 (W8A16) binary
 
 CXX      ?= g++
 CXXFLAGS ?= -O3 -march=native -std=c++17 -Isrc -Wall
@@ -12,6 +13,7 @@ NVCC           ?= nvcc
 NVCCFLAGS_BASE := -O3 -std=c++17 -Isrc -Ikernels -arch=sm_75
 NVCCFLAGS      := $(NVCCFLAGS_BASE) -DUSE_CUDA
 NVCCFLAGS_FP16 := $(NVCCFLAGS_BASE) -DUSE_CUDA_FP16
+NVCCFLAGS_INT8 := $(NVCCFLAGS_BASE) -DUSE_CUDA_INT8
 
 CU_SRC         := src/infer_gpu_fp32.cu \
                   kernels/fp32/rmsnorm.cu  kernels/fp32/rope.cu \
@@ -21,15 +23,20 @@ CU_SRC_FP16    := src/infer_gpu_fp16.cu \
                   kernels/fp16/rmsnorm.cu  kernels/fp16/rope.cu \
                   kernels/fp16/swiglu.cu   kernels/fp16/matmul.cu \
                   kernels/fp16/attention.cu
+CU_SRC_INT8    := src/infer_gpu_int8.cu \
+                  kernels/fp16/rmsnorm.cu  kernels/fp16/rope.cu \
+                  kernels/fp16/swiglu.cu   kernels/fp16/attention.cu \
+                  kernels/int8/matmul.cu   kernels/int8/embedding.cu
 GPU_CPP        := src/main.cpp src/model.cpp src/sampler.cpp
 
 BUILD := build
 
-.PHONY: all cpu gpu gpu_fp16 clean
+.PHONY: all cpu gpu gpu_fp16 gpu_int8 clean
 all: cpu
 cpu: $(BUILD)/tinyllm_naive $(BUILD)/tinyllm_omp
 gpu: $(BUILD)/tinyllm_gpu
 gpu_fp16: $(BUILD)/tinyllm_gpu_fp16
+gpu_int8: $(BUILD)/tinyllm_gpu_int8
 
 # Naive single-threaded baseline (OpenMP pragmas are ignored without -fopenmp).
 $(BUILD)/tinyllm_naive: $(SRC) | $(BUILD)
@@ -46,6 +53,10 @@ $(BUILD)/tinyllm_gpu: $(CU_SRC) $(GPU_CPP) | $(BUILD)
 # GPU FP16 build (Phase 3).
 $(BUILD)/tinyllm_gpu_fp16: $(CU_SRC_FP16) $(GPU_CPP) | $(BUILD)
 	$(NVCC) $(NVCCFLAGS_FP16) $(CU_SRC_FP16) $(GPU_CPP) -o $@
+
+# GPU INT8 W8A16 build (Phase 4).
+$(BUILD)/tinyllm_gpu_int8: $(CU_SRC_INT8) $(GPU_CPP) | $(BUILD)
+	$(NVCC) $(NVCCFLAGS_INT8) $(CU_SRC_INT8) $(GPU_CPP) -o $@
 
 $(BUILD):
 	mkdir -p $(BUILD)
