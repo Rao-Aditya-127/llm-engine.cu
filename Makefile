@@ -3,6 +3,7 @@
 #   make gpu                -> Phase 2 CUDA FP32 binary (nvcc, needs an NVIDIA GPU)
 #   make gpu_fp16           -> Phase 3 CUDA FP16 binary
 #   make gpu_int8           -> Phase 4 CUDA INT8 (W8A16) binary
+#   make server             -> server/llm_engine*.so  (pybind11, needs nvcc + Python)
 
 CXX      ?= g++
 CXXFLAGS ?= -O3 -march=native -std=c++17 -Isrc -Wall
@@ -31,12 +32,23 @@ GPU_CPP        := src/main.cpp src/model.cpp src/sampler.cpp
 
 BUILD := build
 
-.PHONY: all cpu gpu gpu_fp16 gpu_int8 clean
+# ---- pybind11 / server .so ----
+PYTHON      ?= python3
+PY_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes)
+PY_EXT      := $(shell $(PYTHON) -c \
+    "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+SO_TARGET   := server/llm_engine$(PY_EXT)
+
+CU_SRC_SERVER := server/engine.cpp server/bindings.cpp \
+                 $(CU_SRC_FP16) src/model.cpp src/sampler.cpp
+
+.PHONY: all cpu gpu gpu_fp16 gpu_int8 server clean
 all: cpu
 cpu: $(BUILD)/tinyllm_naive $(BUILD)/tinyllm_omp
 gpu: $(BUILD)/tinyllm_gpu
 gpu_fp16: $(BUILD)/tinyllm_gpu_fp16
 gpu_int8: $(BUILD)/tinyllm_gpu_int8
+server: $(SO_TARGET)
 
 # Naive single-threaded baseline (OpenMP pragmas are ignored without -fopenmp).
 $(BUILD)/tinyllm_naive: $(SRC) | $(BUILD)
@@ -61,5 +73,14 @@ $(BUILD)/tinyllm_gpu_int8: $(CU_SRC_INT8) $(GPU_CPP) | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
+# pybind11 shared library — compiled by nvcc so it can link the CUDA kernels.
+$(SO_TARGET): $(CU_SRC_SERVER) | server
+	$(NVCC) $(NVCCFLAGS_FP16) -shared -fPIC \
+	    -Iserver $(PY_INCLUDES) \
+	    $(CU_SRC_SERVER) -o $@
+
+server:
+	mkdir -p server
+
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) $(SO_TARGET)
