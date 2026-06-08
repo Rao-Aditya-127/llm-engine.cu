@@ -69,10 +69,15 @@ int main(int argc, char** argv) {
     Runner runner(model);
     int V = runner.vocab_size();
 
-    // Prefill: process every prompt token; keep the logits after the last one.
+    // Prefill: process all prompt tokens in one batched GEMM pass (FP16/INT8
+    // runners) or fall back to the sequential GEMV loop (FP32/CPU runners).
     const float* logits = nullptr;
+#if defined(USE_CUDA_FP16)
+    logits = runner.prefill(prompt.data(), (int)prompt.size());
+#else
     for (size_t i = 0; i < prompt.size(); ++i)
         logits = runner.forward(prompt[i], (int)i);
+#endif
 
     if (!dump_logits.empty()) {
         FILE* f = std::fopen(dump_logits.c_str(), "wb");

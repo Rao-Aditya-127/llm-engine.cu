@@ -30,10 +30,9 @@ std::vector<int> LLMEngine::generate_ids(
         float                   top_p,
         unsigned long long      seed) {
 
-    // Prefill: feed every prompt token to populate the KV cache.
-    const float* logits = nullptr;
-    for (int i = 0; i < static_cast<int>(prompt_ids.size()); ++i)
-        logits = impl_->runner.forward(prompt_ids[i], i);
+    // Prefill: single batched GEMM pass over all prompt tokens.
+    const float* logits = impl_->runner.prefill(
+        prompt_ids.data(), static_cast<int>(prompt_ids.size()));
 
     RunConfig cfg;
     cfg.temperature    = temperature;
@@ -61,9 +60,8 @@ void LLMEngine::generate_ids_streaming(
         float                           top_p,
         unsigned long long              seed) {
 
-    const float* logits = nullptr;
-    for (int i = 0; i < static_cast<int>(prompt_ids.size()); ++i)
-        logits = impl_->runner.forward(prompt_ids[i], i);
+    const float* logits = impl_->runner.prefill(
+        prompt_ids.data(), static_cast<int>(prompt_ids.size()));
 
     RunConfig cfg;
     cfg.temperature    = temperature;

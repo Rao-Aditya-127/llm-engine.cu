@@ -74,13 +74,11 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 # pybind11 shared library — compiled by nvcc so it can link the CUDA kernels.
-$(SO_TARGET): $(CU_SRC_SERVER) | server
-	$(NVCC) $(NVCCFLAGS_FP16) -shared -fPIC \
+# server/ directory is committed to git so no mkdir needed here.
+$(SO_TARGET): $(CU_SRC_SERVER)
+	$(NVCC) $(NVCCFLAGS_FP16) -shared -Xcompiler -fPIC \
 	    -Iserver $(PY_INCLUDES) \
 	    $(CU_SRC_SERVER) -o $@
-
-server:
-	mkdir -p server
 
 clean:
 	rm -rf $(BUILD) $(SO_TARGET)

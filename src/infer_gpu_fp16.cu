@@ -20,6 +20,17 @@ static void residual_add(uint16_t* x, const uint16_t* y, int n) {
     residual_add_fp16_kernel<<<blocks, threads>>>(asHalf(x), asHalf(y), n);
 }
 
+// Embedding gather: d_out[t × H] = table[d_ids[t] × H]  for t = 0..seq_len-1.
+// One block per token, threads stride over H.
+__global__ void embed_gather_fp16_kernel(__half* out, const __half* table,
+                                         const int* ids, int H) {
+    int t = blockIdx.x;
+    const __half* row = table + (size_t)ids[t] * H;
+    __half*       dst = out   + (size_t)t      * H;
+    for (int i = threadIdx.x; i < H; i += blockDim.x)
+        dst[i] = row[i];
+}
+
 // ---------------------------------------------------------------------------
 
 GpuRunnerFP16::GpuRunnerFP16(const Model& model) {
@@ -68,13 +79,17 @@ GpuRunnerFP16::GpuRunnerFP16(const Model& model) {
     size_t cache = (size_t)header_.num_layers * KV_CACHE_CAP * KV;
     CUDA_CHECK(cudaMalloc(&d_kcache_, cache * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&d_vcache_, cache * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_x_,      H * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_xn_,     H * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_q_,      QD * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_attn_,   QD * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_gate_,   I * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_up_,     I * sizeof(uint16_t)));
+    // Activation buffers are over-allocated to KV_CACHE_CAP rows so the same
+    // pointers work for both the single-token decode path (row 0) and the
+    // batched prefill path (rows 0..seq_len-1).
+    CUDA_CHECK(cudaMalloc(&d_x_,    (size_t)KV_CACHE_CAP * H  * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_xn_,   (size_t)KV_CACHE_CAP * H  * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_q_,    (size_t)KV_CACHE_CAP * QD * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_attn_, (size_t)KV_CACHE_CAP * QD * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_gate_, (size_t)KV_CACHE_CAP * I  * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_up_,   (size_t)KV_CACHE_CAP * I  * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&d_logits_, (size_t)vocab_ * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ids_,    (size_t)KV_CACHE_CAP * sizeof(int)));
 
     logits_.resize(vocab_);
 }
@@ -83,7 +98,7 @@ GpuRunnerFP16::~GpuRunnerFP16() {
     cudaFree(d_weights_h_);
     cudaFree(d_kcache_); cudaFree(d_vcache_);
     cudaFree(d_x_); cudaFree(d_xn_); cudaFree(d_q_); cudaFree(d_attn_);
-    cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_logits_);
+    cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_logits_); cudaFree(d_ids_);
 }
 
 const float* GpuRunnerFP16::forward(int token_id, int pos) {
@@ -140,6 +155,91 @@ const float* GpuRunnerFP16::forward(int token_id, int pos) {
     // final norm + LM head (tied embedding). LM head writes FP32 logits
     // directly so the host sampler doesn't need a conversion step.
     rmsnorm_fp16_cuda(asHalf(d_xn_), asHalf(d_x_), asHalf(d_final_norm_h_), H);
+    matmul_fp16_to_fp32_cuda(d_logits_, asHalf(d_embed_h_), asHalf(d_xn_),
+                             vocab_, H);
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(logits_.data(), d_logits_,
+                          (size_t)vocab_ * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    return logits_.data();
+}
+
+// ---------------------------------------------------------------------------
+// Batched prefill: processes all seq_len prompt tokens in a single GEMM pass
+// per layer rather than seq_len separate GEMV calls.
+// ---------------------------------------------------------------------------
+const float* GpuRunnerFP16::prefill(const int* ids, int seq_len) {
+    const int H   = header_.hidden_size;
+    const int I   = header_.intermediate_size;
+    const int NH  = header_.num_heads;
+    const int NKV = header_.num_kv_heads;
+    const int HD  = header_.head_dim;
+    const int QD  = NH  * HD;
+    const int KV  = NKV * HD;
+
+    // Copy token indices to device for the gather kernel.
+    CUDA_CHECK(cudaMemcpy(d_ids_, ids, (size_t)seq_len * sizeof(int),
+                          cudaMemcpyHostToDevice));
+
+    // Gather embeddings: d_x_[t × H] = embed[ids[t]]  for t = 0..seq_len-1
+    embed_gather_fp16_kernel<<<seq_len, 256>>>(asHalf(d_x_), asHalf(d_embed_h_),
+                                               d_ids_, H);
+
+    for (int l = 0; l < (int)header_.num_layers; ++l) {
+        const LayerWeightsHalf& L = d_layers_h_[l];
+        // K/V written directly into the cache rows 0..seq_len-1.
+        uint16_t* kbase = d_kcache_ + (size_t)l * KV_CACHE_CAP * KV;
+        uint16_t* vbase = d_vcache_ + (size_t)l * KV_CACHE_CAP * KV;
+
+        // ---- attention block ----
+        rmsnorm_batched_fp16_cuda(asHalf(d_xn_), asHalf(d_x_),
+                                  asHalf(L.input_layernorm), H, seq_len);
+
+        matmul_batched_fp16_cuda(asHalf(d_q_),    asHalf(L.q_proj_w),
+                                 asHalf(d_xn_),   asHalf(L.q_proj_b),
+                                 seq_len, QD, H);
+        matmul_batched_fp16_cuda(asHalf(kbase),   asHalf(L.k_proj_w),
+                                 asHalf(d_xn_),   asHalf(L.k_proj_b),
+                                 seq_len, KV, H);
+        matmul_batched_fp16_cuda(asHalf(vbase),   asHalf(L.v_proj_w),
+                                 asHalf(d_xn_),   asHalf(L.v_proj_b),
+                                 seq_len, KV, H);
+
+        rope_batched_fp16_cuda(asHalf(d_q_),  NH,  HD, seq_len);
+        rope_batched_fp16_cuda(asHalf(kbase), NKV, HD, seq_len);
+
+        attention_prefill_fp16_cuda(asHalf(d_attn_), asHalf(d_q_),
+                                    asHalf(kbase), asHalf(vbase),
+                                    seq_len, NH, NKV, HD);
+
+        matmul_batched_fp16_cuda(asHalf(d_xn_), asHalf(L.o_proj_w),
+                                 asHalf(d_attn_), nullptr,
+                                 seq_len, H, QD);
+        residual_add(d_x_, d_xn_, H * seq_len);
+
+        // ---- SwiGLU FFN ----
+        rmsnorm_batched_fp16_cuda(asHalf(d_xn_), asHalf(d_x_),
+                                  asHalf(L.post_attn_layernorm), H, seq_len);
+
+        matmul_batched_fp16_cuda(asHalf(d_gate_), asHalf(L.gate_proj_w),
+                                 asHalf(d_xn_), nullptr,
+                                 seq_len, I, H);
+        matmul_batched_fp16_cuda(asHalf(d_up_),   asHalf(L.up_proj_w),
+                                 asHalf(d_xn_), nullptr,
+                                 seq_len, I, H);
+        // Element-wise SwiGLU: reuse existing kernel, just cover seq_len × I elements.
+        swiglu_fp16_cuda(asHalf(d_gate_), asHalf(d_up_), I * seq_len);
+
+        matmul_batched_fp16_cuda(asHalf(d_xn_), asHalf(L.down_proj_w),
+                                 asHalf(d_gate_), nullptr,
+                                 seq_len, H, I);
+        residual_add(d_x_, d_xn_, H * seq_len);
+    }
+
+    // Final norm + LM head on the LAST token's hidden state only.
+    const uint16_t* last_x = d_x_ + (size_t)(seq_len - 1) * H;
+    rmsnorm_fp16_cuda(asHalf(d_xn_), asHalf(last_x), asHalf(d_final_norm_h_), H);
     matmul_fp16_to_fp32_cuda(d_logits_, asHalf(d_embed_h_), asHalf(d_xn_),
                              vocab_, H);
 

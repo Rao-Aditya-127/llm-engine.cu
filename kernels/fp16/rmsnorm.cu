@@ -34,3 +34,45 @@ void rmsnorm_fp16_cuda(__half* out, const __half* x, const __half* w, int n) {
     const int threads = 256;
     rmsnorm_fp16_kernel<<<1, threads, threads * sizeof(float)>>>(out, x, w, n);
 }
+
+// ---------------------------------------------------------------------------
+// Batched RMSNorm: one block per row of x[seq_len × n].
+// ---------------------------------------------------------------------------
+__global__ void rmsnorm_batched_fp16_kernel(__half* out, const __half* x,
+                                            const __half* w, int n, int seq_len) {
+    int s = blockIdx.x;
+    if (s >= seq_len) return;
+
+    extern __shared__ float red[];
+    int tid = threadIdx.x;
+
+    const __half* xi   = x   + (size_t)s * n;
+    __half*       outi = out + (size_t)s * n;
+
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float xf = __half2float(xi[i]);
+        local += xf * xf;
+    }
+    red[tid] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(red[0] / n + qwen2::RMS_NORM_EPS);
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        float xf = __half2float(xi[i]);
+        float wf = __half2float(w[i]);
+        outi[i] = __float2half(xf * scale * wf);
+    }
+}
+
+void rmsnorm_batched_fp16_cuda(__half* out, const __half* x, const __half* w,
+                               int n, int seq_len) {
+    const int threads = 256;
+    rmsnorm_batched_fp16_kernel<<<seq_len, threads, threads * sizeof(float)>>>(
+        out, x, w, n, seq_len);
+}

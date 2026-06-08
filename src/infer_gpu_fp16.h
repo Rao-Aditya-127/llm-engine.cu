@@ -14,9 +14,14 @@ public:
     GpuRunnerFP16(const GpuRunnerFP16&) = delete;
     GpuRunnerFP16& operator=(const GpuRunnerFP16&) = delete;
 
-    // Run one token at sequence position `pos`.
+    // Run one token at sequence position `pos` (decode path, GEMV).
     // Returns a host pointer to FP32 logits [vocab_size] (for the sampler).
     const float* forward(int token_id, int pos);
+
+    // Run all prompt tokens in one batched GEMM pass (prefill path).
+    // Writes K/V for positions 0..seq_len-1 into the cache.
+    // Returns host FP32 logits for the last token — feed directly into sample().
+    const float* prefill(const int* ids, int seq_len);
 
     int vocab_size() const { return vocab_; }
 
@@ -31,14 +36,18 @@ private:
     std::vector<LayerWeightsHalf> d_layers_h_;
 
     // KV cache and per-step scratch — all FP16.
+    // Activation buffers are sized at KV_CACHE_CAP × dim so that both the
+    // single-token decode path (uses row 0 only) and the batched prefill path
+    // (uses rows 0..seq_len-1) share the same allocations.
     uint16_t* d_kcache_ = nullptr;
     uint16_t* d_vcache_ = nullptr;
-    uint16_t* d_x_ = nullptr;
-    uint16_t* d_xn_ = nullptr;
-    uint16_t* d_q_ = nullptr;
-    uint16_t* d_attn_ = nullptr;
-    uint16_t* d_gate_ = nullptr;
-    uint16_t* d_up_ = nullptr;
+    uint16_t* d_x_    = nullptr;   // [KV_CACHE_CAP × H]
+    uint16_t* d_xn_   = nullptr;   // [KV_CACHE_CAP × H]
+    uint16_t* d_q_    = nullptr;   // [KV_CACHE_CAP × QD]
+    uint16_t* d_attn_ = nullptr;   // [KV_CACHE_CAP × QD]
+    uint16_t* d_gate_ = nullptr;   // [KV_CACHE_CAP × I]
+    uint16_t* d_up_   = nullptr;   // [KV_CACHE_CAP × I]
+    int*      d_ids_  = nullptr;   // [KV_CACHE_CAP] — scratch for embed gather
 
     // Logits stay FP32 (the LM-head matmul writes float directly).
     float* d_logits_ = nullptr;
