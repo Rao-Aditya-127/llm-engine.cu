@@ -33,6 +33,46 @@ known error accumulation on sub-1B models (see [details.md](details.md), Phase 4
 
 ---
 
+## Competing with a Production Inference Engine — vLLM (L4)
+
+The T4 comparison above uses HuggingFace as a baseline to isolate Python dispatch
+overhead. This comparison uses a production inference engine.
+
+Benchmarked on an NVIDIA L4 (compute capability 8.9) — the T4's 7.5 does not
+support Flash Attention 2, so vLLM's full stack (FA2, CUDA graphs, torch.compile)
+only runs on L4. Same model weights (Qwen2-0.5B-Instruct FP16), 200-token output.
+
+| System               | Batch |  tok/s |
+|----------------------|-------|--------|
+| llm-engine.cu (FP16) | 1     |    190 |
+| vLLM (FP16)          | 1     |    185 |
+| vLLM (FP16)          | 50    |  8,456 |
+
+At batch=1, a raw CUDA binary with no framework trades blows with vLLM's full
+optimization stack. The numbers look identical because vLLM's key optimizations
+simply do not apply to this workload.
+
+Flash Attention 2 speeds up attention over long sequences — at decode time there is
+only one new token per step, so there is nothing for it to optimize. cuBLAS provides
+highly tuned matrix multiplication for large batches — at batch=1 every linear layer
+reduces to a matrix-vector product, which cannot utilize tensor cores regardless of
+the library. CUDA graphs and torch.compile eliminate Python dispatch overhead — this
+engine has no Python in the hot path to begin with.
+
+Strip away everything that does not apply, and both engines are left doing the same
+work: reading the full ~990 MB of model weights from GPU memory once per token. At
+L4's ~300 GB/s bandwidth that is a hard floor of ~3 ms per token, and both engines
+are sitting on it.
+
+At batch=50, vLLM reaches 8,456 tok/s — 44× higher. The reason
+is arithmetic: every weight matrix is read from HBM once but produces 50 output
+vectors instead of one. Same memory bandwidth cost, 50× the useful work. That gap
+is not a kernel problem, it is an architecture problem — closing it requires batched
+decode, per-sequence KV cache management, and a request scheduler. That is the
+natural next step for this engine.
+
+---
+
 ## Repository structure
 
 ```
