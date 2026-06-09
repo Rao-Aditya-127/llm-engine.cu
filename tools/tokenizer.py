@@ -13,7 +13,7 @@ import sys
 
 from transformers import AutoTokenizer
 
-MODEL_ID = "Qwen/Qwen2-0.5B"
+MODEL_ID = "Qwen/Qwen2-0.5B-Instruct"
 
 
 def main():

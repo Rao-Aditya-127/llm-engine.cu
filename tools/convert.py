@@ -36,7 +36,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 
-MODEL_ID = "Qwen/Qwen2-0.5B"
+MODEL_ID = "Qwen/Qwen2-0.5B-Instruct"
 MAGIC = 0x4D4C4E54
 VERSION = 1
 HEADER_FMT = "<10I2f"  # magic,version,dtype,hidden,inter,layers,heads,kv_heads,head_dim,vocab, eps,theta
