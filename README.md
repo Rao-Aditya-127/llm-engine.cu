@@ -48,6 +48,11 @@ only runs on L4. Same model weights (Qwen2-0.5B-Instruct FP16), 200-token output
 | vLLM (FP16)          | 1     |    185 |
 | vLLM (FP16)          | 50    |  8,456 |
 
+> **TL;DR** — At batch=1 a hand-written CUDA engine matches a full production stack
+> because both hit the same memory bandwidth ceiling. vLLM's 44× advantage at
+> batch=50 comes from batching, not better kernels. The bottleneck was always
+> bandwidth, not software.
+
 At batch=1, a raw CUDA binary with no framework trades blows with vLLM's full
 optimization stack. The numbers look identical because vLLM's key optimizations
 simply do not apply to this workload.
