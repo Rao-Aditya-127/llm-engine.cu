@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
@@ -103,6 +103,15 @@ class GenerateResponse(BaseModel):
     response:         str
     tokens_generated: int
     time_ms:          float
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return (Path(__file__).parent / "index.html").read_text()
 
 
 # ---------------------------------------------------------------------------
