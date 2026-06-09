@@ -47,6 +47,7 @@ std::vector<int> LLMEngine::generate_ids(
     for (int step = 0; step < max_tokens; ++step) {
         int tok = sample(logits, impl_->runner.vocab_size(), cfg, rng);
         out.push_back(tok);
+        if (tok == qwen2::EOS_TOKEN_ID || tok == qwen2::IM_END_TOKEN_ID) break;
         logits = impl_->runner.forward(tok, pos++);
     }
     return out;
@@ -73,7 +74,8 @@ void LLMEngine::generate_ids_streaming(
 
     for (int step = 0; step < max_tokens; ++step) {
         int tok = sample(logits, impl_->runner.vocab_size(), cfg, rng);
-        on_token(tok);                              // fire immediately
+        if (tok == qwen2::EOS_TOKEN_ID || tok == qwen2::IM_END_TOKEN_ID) break;
+        on_token(tok);
         logits = impl_->runner.forward(tok, pos++);
     }
 }

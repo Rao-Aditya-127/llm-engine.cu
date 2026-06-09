@@ -38,7 +38,7 @@ from llm_engine import LLMEngine
 app = FastAPI(title="TinyLLM", description="Qwen2-0.5B FP16 inference server")
 
 MODEL_PATH = "tinyllm_fp16.bin"   # relative to cwd where uvicorn is launched
-MODEL_ID   = "Qwen/Qwen2-0.5B-Instruct"
+MODEL_ID   = "Qwen/Qwen2-1.5B-Instruct"
 
 print(f"Loading tokenizer ({MODEL_ID}) ...")
 _tok = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -118,10 +118,17 @@ def index():
 # Phase 1 — blocking endpoint
 # ---------------------------------------------------------------------------
 
+def _apply_chat_template(prompt: str) -> list[int]:
+    """Wrap a raw user message in the Instruct chat template."""
+    messages = [{"role": "user", "content": prompt}]
+    return _tok.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True)
+
+
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest) -> GenerateResponse:
     """Generate a response for the given prompt. Blocks until complete."""
-    prompt_ids = _tok.encode(req.prompt)
+    prompt_ids = _apply_chat_template(req.prompt)
     t0 = time.perf_counter()
 
     pending = _PendingRequest(prompt_ids, req.max_tokens,
@@ -148,7 +155,7 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
     Each event is: data: {"token": "<text>"}\\n\\n
     Final event is: data: [DONE]\\n\\n
     """
-    prompt_ids = _tok.encode(req.prompt)
+    prompt_ids = _apply_chat_template(req.prompt)
     token_queue: queue.Queue[int | None] = queue.Queue()
 
     def on_token(token_id: int) -> None:

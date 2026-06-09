@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     for (int step = 0; step < cfg.max_new_tokens; ++step) {
         int tok = sample(logits, V, cfg, rng);
         generated.push_back(tok);
+        if (tok == qwen2::EOS_TOKEN_ID || tok == qwen2::IM_END_TOKEN_ID) break;
         logits = runner.forward(tok, pos++);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
