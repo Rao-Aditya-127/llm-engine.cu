@@ -21,6 +21,7 @@ the server/ directory in sys.path (added below) is enough.
 
 import itertools
 import json
+import os
 import queue
 import sys
 import threading
@@ -43,7 +44,8 @@ from llm_engine import LLMEngine
 app = FastAPI(title="TinyLLM", description="Qwen2-0.5B FP16 inference server")
 
 MODEL_PATH = "tinyllm_fp16.bin"   # relative to cwd where uvicorn is launched
-MODEL_ID   = "Qwen/Qwen2-1.5B-Instruct"
+# Override with: export TINYLLM_MODEL=Qwen/Qwen2-1.5B-Instruct
+MODEL_ID   = os.environ.get("TINYLLM_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 
 print(f"Loading tokenizer ({MODEL_ID}) ...")
 _tok = AutoTokenizer.from_pretrained(MODEL_ID)

@@ -9,11 +9,13 @@ Usage:
   python tokenizer.py decode 9707 1879          # -> text
 """
 import argparse
+import os
 import sys
 
 from transformers import AutoTokenizer
 
-MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
+# Override with: export TINYLLM_MODEL=Qwen/Qwen2-1.5B-Instruct
+MODEL_ID = os.environ.get("TINYLLM_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 
 
 def main():

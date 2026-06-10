@@ -6,10 +6,12 @@ Usage:
     python tools/hf_check.py --max-new 30
 """
 import argparse
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
+# Override with: export TINYLLM_MODEL=Qwen/Qwen2-1.5B-Instruct
+MODEL_ID = os.environ.get("TINYLLM_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 
 def main():
     ap = argparse.ArgumentParser()

@@ -10,6 +10,7 @@ Two checks:
 Run from the repo root after `make server`:
     python tools/batch_check.py
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 from transformers import AutoTokenizer
 from llm_engine import LLMEngine
 
-MODEL_ID   = "Qwen/Qwen2-1.5B-Instruct"
+# Override with: export TINYLLM_MODEL=Qwen/Qwen2-1.5B-Instruct
+MODEL_ID   = os.environ.get("TINYLLM_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 MODEL_PATH = "tinyllm_fp16.bin"
 PROMPT     = "What is the capital of France?"
 STEPS      = 20

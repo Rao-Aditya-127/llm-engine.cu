@@ -29,6 +29,7 @@ File layout (little-endian):
 All matmul weights keep HF's [out_features, in_features] row-major layout.
 """
 import argparse
+import os
 import struct
 import sys
 
@@ -36,7 +37,8 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 
-MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
+# Override with: export TINYLLM_MODEL=Qwen/Qwen2-1.5B-Instruct
+MODEL_ID = os.environ.get("TINYLLM_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 MAGIC = 0x4D4C4E54
 VERSION = 1
 HEADER_FMT = "<10I2f"  # magic,version,dtype,hidden,inter,layers,heads,kv_heads,head_dim,vocab, eps,theta
