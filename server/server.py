@@ -1,10 +1,14 @@
 """TinyLLM FastAPI inference server.
 
-Phases implemented here:
-  Phase 1 — POST /generate          (blocking, full response)
-  Phase 2 — POST /generate/stream   (SSE, tokens arrive one by one)
-  Phase 3 — thread-safe request queue (one background thread owns the engine;
-             concurrent HTTP requests queue up safely)
+A single background scheduler thread owns the engine and runs **continuous
+batching**: many sequences decode together in one batched GPU step, and the
+scheduler admits new requests / evicts finished ones every step. Both
+/generate (blocking) and /generate/stream (SSE) feed the same scheduler.
+
+  POST /generate          — blocking, full response
+  POST /generate/stream   — SSE, tokens arrive one by one
+  GET  /health            — slot occupancy + queue depth
+  GET  /                  — demo UI
 
 Start:
     cd <repo-root>
@@ -15,6 +19,7 @@ server/llm_engine<ext>.so; running uvicorn from the repo root and having
 the server/ directory in sys.path (added below) is enough.
 """
 
+import itertools
 import json
 import queue
 import sys
@@ -45,48 +50,119 @@ _tok = AutoTokenizer.from_pretrained(MODEL_ID)
 
 print(f"Loading engine ({MODEL_PATH}) ...")
 _engine = LLMEngine(MODEL_PATH)
-print("Engine ready.")
+print(f"Engine ready. {_engine.max_slots()} batch slots.")
+
+# Tokens that end generation: <|endoftext|> and the chat-turn terminator.
+STOP_IDS = {
+    _tok.eos_token_id,
+    _tok.convert_tokens_to_ids("<|im_end|>"),
+}
 
 # ---------------------------------------------------------------------------
-# Phase 3 — single background worker owns the engine
+# Continuous-batch scheduler
 # ---------------------------------------------------------------------------
 
-class _PendingRequest:
-    """Holds one HTTP request waiting for the engine worker."""
-    def __init__(self, prompt_ids: list[int], max_tokens: int,
-                 temperature: float, top_p: float,
-                 streaming: bool = False,
-                 on_token=None):
+MAX_SLOTS  = _engine.max_slots()
+_seed_seq  = itertools.count(1)        # distinct seeds so sampled runs differ
+
+
+class _Seq:
+    """One in-flight sequence. Output goes to a queue (streaming) or a result
+    list guarded by an event (blocking)."""
+    def __init__(self, prompt_ids, max_tokens, temperature, top_p, streaming):
         self.prompt_ids  = prompt_ids
         self.max_tokens  = max_tokens
         self.temperature = temperature
         self.top_p       = top_p
+        self.seed        = next(_seed_seq)
         self.streaming   = streaming
-        self.on_token    = on_token   # callable(token_id: int) — streaming only
-        self.result: list[int] | None = None
-        self.event = threading.Event()
 
-_request_queue: queue.Queue[_PendingRequest] = queue.Queue()
+        # scheduler-owned state
+        self.slot        = -1
+        self.pos         = 0
+        self.generated   = 0
+        self.last_token  = 0
+        self.finished    = False
+
+        # output channels
+        self.out_queue: queue.Queue = queue.Queue() if streaming else None
+        self.result: list[int]      = []
+        self.event   = threading.Event()
+
+    def emit(self, token_id: int) -> None:
+        if self.streaming:
+            self.out_queue.put(token_id)
+        else:
+            self.result.append(token_id)
+
+    def finish(self) -> None:
+        self.finished = True
+        if self.streaming:
+            self.out_queue.put(None)   # sentinel — closes the SSE stream
+        self.event.set()
 
 
-def _engine_worker() -> None:
-    """Single thread that serialises all calls into the engine."""
+_waiting: queue.Queue[_Seq] = queue.Queue()
+_active: list[_Seq] = []
+_free_slots: list[int] = list(range(MAX_SLOTS))
+
+
+def _admit(seq: _Seq) -> None:
+    """Assign a free slot, prefill the prompt, and emit the first token."""
+    seq.slot = _free_slots.pop()
+    first = _engine.prefill_slot(seq.prompt_ids, seq.slot,
+                                 seq.temperature, seq.top_p, seq.seed)
+    seq.pos        = len(seq.prompt_ids)   # next decode places last_token here
+    seq.generated  = 1
+    seq.last_token = first
+
+    is_stop = first in STOP_IDS
+    if not is_stop:
+        seq.emit(first)
+    if is_stop or seq.generated >= seq.max_tokens:
+        seq.finish()
+        _free_slots.append(seq.slot)
+    else:
+        _active.append(seq)
+
+
+def _scheduler() -> None:
+    """Continuous batching: admit waiting requests into free slots, then run
+    one batched decode step over every active sequence, every iteration."""
     while True:
-        req = _request_queue.get()
-        try:
-            if req.streaming:
-                _engine.generate_ids_streaming(
-                    req.prompt_ids, req.max_tokens, req.on_token,
-                    req.temperature, req.top_p)
-            else:
-                req.result = _engine.generate_ids(
-                    req.prompt_ids, req.max_tokens,
-                    req.temperature, req.top_p)
-        finally:
-            req.event.set()   # wake up the waiting HTTP handler
+        # If nothing is running, block until at least one request arrives.
+        if not _active:
+            _admit(_waiting.get())
+        # Fill any remaining free slots without blocking.
+        while _free_slots and not _waiting.empty():
+            try:
+                _admit(_waiting.get_nowait())
+            except queue.Empty:
+                break
+        if not _active:
+            continue
+
+        # One batched decode step over all active sequences.
+        next_toks = _engine.decode_batch(
+            [s.last_token for s in _active],
+            [s.pos for s in _active],
+            [s.slot for s in _active])
+
+        for s, t in zip(_active, next_toks):
+            s.pos       += 1
+            s.generated += 1
+            s.last_token = t
+            is_stop = t in STOP_IDS
+            if not is_stop:
+                s.emit(t)
+            if is_stop or s.generated >= s.max_tokens:
+                s.finish()
+                _free_slots.append(s.slot)
+
+        _active[:] = [s for s in _active if not s.finished]
 
 
-threading.Thread(target=_engine_worker, daemon=True, name="engine-worker").start()
+threading.Thread(target=_scheduler, daemon=True, name="scheduler").start()
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -120,9 +196,10 @@ def index():
 
 def _apply_chat_template(prompt: str) -> list[int]:
     """Wrap a raw user message in the Instruct chat template."""
-    messages = [{"role": "user", "content": prompt}]
-    return _tok.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True)
+    text = _tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False, add_generation_prompt=True)
+    return _tok.encode(text, add_special_tokens=False)
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -131,21 +208,21 @@ def generate(req: GenerateRequest) -> GenerateResponse:
     prompt_ids = _apply_chat_template(req.prompt)
     t0 = time.perf_counter()
 
-    pending = _PendingRequest(prompt_ids, req.max_tokens,
-                              req.temperature, req.top_p)
-    _request_queue.put(pending)
-    pending.event.wait()
+    seq = _Seq(prompt_ids, req.max_tokens, req.temperature, req.top_p,
+               streaming=False)
+    _waiting.put(seq)
+    seq.event.wait()
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return GenerateResponse(
-        response         = _tok.decode(pending.result),
-        tokens_generated = len(pending.result),
+        response         = _tok.decode(seq.result, skip_special_tokens=True),
+        tokens_generated = len(seq.result),
         time_ms          = round(elapsed_ms, 1),
     )
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — streaming endpoint (Server-Sent Events)
+# Streaming endpoint (Server-Sent Events)
 # ---------------------------------------------------------------------------
 
 @app.post("/generate/stream")
@@ -156,29 +233,18 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
     Final event is: data: [DONE]\\n\\n
     """
     prompt_ids = _apply_chat_template(req.prompt)
-    token_queue: queue.Queue[int | None] = queue.Queue()
-
-    def on_token(token_id: int) -> None:
-        token_queue.put(token_id)
-
-    pending = _PendingRequest(prompt_ids, req.max_tokens,
-                              req.temperature, req.top_p,
-                              streaming=True, on_token=on_token)
-    _request_queue.put(pending)
+    seq = _Seq(prompt_ids, req.max_tokens, req.temperature, req.top_p,
+               streaming=True)
+    _waiting.put(seq)
 
     def event_stream():
         while True:
-            token_id = token_queue.get()
-            # pending.event is set after the last on_token call returns.
-            # Check: if the event fired and the queue is now drained, we're done.
-            if pending.event.is_set() and token_queue.empty():
-                # token_id itself may still be a real token — yield it first.
-                if token_id is not None:
-                    yield f"data: {json.dumps({'token': _tok.decode([token_id])})}\n\n"
+            token_id = seq.out_queue.get()
+            if token_id is None:          # sentinel from finish()
                 yield "data: [DONE]\n\n"
                 break
-            if token_id is not None:
-                yield f"data: {json.dumps({'token': _tok.decode([token_id])})}\n\n"
+            text = _tok.decode([token_id], skip_special_tokens=True)
+            yield f"data: {json.dumps({'token': text})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -189,9 +255,12 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
 
 @app.get("/health")
 def health() -> dict:
-    """Return server status and current request queue depth."""
+    """Return server status and current scheduler occupancy."""
     return {
-        "status":      "ok",
-        "model":       MODEL_ID,
-        "queue_depth": _request_queue.qsize(),
+        "status":       "ok",
+        "model":        MODEL_ID,
+        "max_slots":    MAX_SLOTS,
+        "active":       len(_active),
+        "free_slots":   len(_free_slots),
+        "queue_depth":  _waiting.qsize(),
     }

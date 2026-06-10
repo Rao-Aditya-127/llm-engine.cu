@@ -98,3 +98,40 @@ void matmul_batched_fp16_cuda(__half* Y, const __half* W, const __half* X,
     matmul_batched_fp16_kernel<<<blocks, threads>>>(Y, W, X, bias,
                                                     seq_len, n_out, n_in);
 }
+
+// ---------------------------------------------------------------------------
+// Batched LM head: Y[batch × n_out] FP32 = X[batch × n_in] × W[n_out × n_in]^T.
+// One warp per output element (b, o); FP32 store, no bias.
+// ---------------------------------------------------------------------------
+__global__ void matmul_batched_fp16_to_fp32_kernel(float* Y, const __half* W,
+                                                   const __half* X,
+                                                   int batch, int n_out, int n_in) {
+    int total_warps = batch * n_out;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= total_warps) return;
+
+    int b = warp / n_out;
+    int o = warp % n_out;
+
+    const __half* w  = W + (size_t)o * n_in;
+    const __half* xb = X + (size_t)b * n_in;
+
+    float acc = 0.0f;
+    for (int i = lane; i < n_in; i += 32)
+        acc += __half2float(w[i]) * __half2float(xb[i]);
+
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+
+    if (lane == 0) Y[(size_t)b * n_out + o] = acc;
+}
+
+void matmul_batched_fp16_to_fp32_cuda(float* Y, const __half* W, const __half* X,
+                                      int batch, int n_out, int n_in) {
+    int total_warps = batch * n_out;
+    const int threads = 256;
+    int blocks = ((size_t)total_warps * 32 + threads - 1) / threads;
+    matmul_batched_fp16_to_fp32_kernel<<<blocks, threads>>>(
+        Y, W, X, batch, n_out, n_in);
+}

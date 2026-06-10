@@ -8,11 +8,15 @@
 // ---------------------------------------------------------------------------
 // Impl — owns Model + GpuRunnerFP16.  All CUDA types are confined here.
 // ---------------------------------------------------------------------------
+// Number of concurrent KV-cache slots the server can keep in flight.
+static constexpr int kMaxSlots = 16;
+
 struct LLMEngine::Impl {
     Model         model;
     GpuRunnerFP16 runner;
 
-    explicit Impl(const std::string& path) : model(path), runner(model) {}
+    explicit Impl(const std::string& path)
+        : model(path), runner(model, kMaxSlots) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +82,26 @@ void LLMEngine::generate_ids_streaming(
         on_token(tok);
         logits = impl_->runner.forward(tok, pos++);
     }
+}
+
+int LLMEngine::prefill_slot(const std::vector<int>& prompt_ids, int slot,
+                            float temperature, float top_p,
+                            unsigned long long seed) {
+    return impl_->runner.prefill_slot(
+        prompt_ids.data(), static_cast<int>(prompt_ids.size()),
+        slot, temperature, top_p, seed);
+}
+
+std::vector<int> LLMEngine::decode_batch(const std::vector<int>& tokens,
+                                         const std::vector<int>& positions,
+                                         const std::vector<int>& slots) {
+    return impl_->runner.decode_batch(
+        tokens.data(), positions.data(), slots.data(),
+        static_cast<int>(tokens.size()));
+}
+
+int LLMEngine::max_slots() const {
+    return impl_->runner.max_slots();
 }
 
 int LLMEngine::vocab_size() const {

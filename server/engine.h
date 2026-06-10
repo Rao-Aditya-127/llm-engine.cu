@@ -29,6 +29,20 @@ public:
                                 float                            top_p       = 1.0f,
                                 unsigned long long               seed        = 1234ULL);
 
+    // --- continuous-batch API (used by the server scheduler) ---
+
+    // Prefill a prompt into KV-cache slot `slot`; returns the first sampled token.
+    int prefill_slot(const std::vector<int>& prompt_ids, int slot,
+                     float temperature = 0.0f, float top_p = 1.0f,
+                     unsigned long long seed = 1234ULL);
+
+    // One decode step over a batch of active sequences. Returns the next token
+    // id for each. tokens/positions/slots are parallel arrays of equal length.
+    std::vector<int> decode_batch(const std::vector<int>& tokens,
+                                  const std::vector<int>& positions,
+                                  const std::vector<int>& slots);
+
+    int max_slots() const;
     int vocab_size() const;
 
 private:

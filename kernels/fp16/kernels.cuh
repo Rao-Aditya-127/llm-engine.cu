@@ -50,3 +50,35 @@ void attention_prefill_fp16_cuda(__half* out, const __half* q,
                                  const __half* kbase, const __half* vbase,
                                  int seq_len, int n_heads, int n_kv_heads,
                                  int head_dim);
+
+// ---------------------------------------------------------------------------
+// Continuous-batch decode variants. Each of `batch` rows is one sequence at its
+// own position in its own KV-cache slot. positions[] and slots[] are device
+// arrays of length `batch`.
+// ---------------------------------------------------------------------------
+
+// RoPE for a decode batch: row r uses angle from positions[r] (not the row index).
+void rope_decode_batched_fp16_cuda(__half* vec, const int* positions,
+                                   int n_heads, int head_dim, int batch);
+
+// Scatter freshly-computed K/V rows into their per-slot, per-position cache cells.
+// k_tmp/v_tmp are [batch × kv_dim]; cache is [num_slots × num_layers × cap × kv_dim].
+void kv_scatter_fp16_cuda(__half* kcache, __half* vcache,
+                          const __half* k_tmp, const __half* v_tmp,
+                          const int* positions, const int* slots,
+                          int batch, int kv_dim, int layer, int num_layers,
+                          int cap);
+
+// Decode-step attention: block (b,h) attends over slot slots[b]'s cache rows
+// 0..positions[b]. kcache/vcache are the full [num_slots × num_layers × cap × kv_dim]
+// blobs; the kernel indexes layer `layer` internally.
+void attention_decode_batched_fp16_cuda(__half* out, const __half* q,
+                                        const __half* kcache, const __half* vcache,
+                                        const int* positions, const int* slots,
+                                        int batch, int n_heads, int n_kv_heads,
+                                        int head_dim, int layer, int num_layers,
+                                        int cap, int max_seqlen);
+
+// Batched LM head: Y[batch × n_out] FP32 = X[batch × n_in] × W[n_out × n_in]^T.
+void matmul_batched_fp16_to_fp32_cuda(float* Y, const __half* W, const __half* X,
+                                      int batch, int n_out, int n_in);

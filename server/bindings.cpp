@@ -54,6 +54,32 @@ PYBIND11_MODULE(llm_engine, m) {
              py::arg("seed")        = 1234ULL,
              "Stream tokens: calls on_token(token_id: int) for each decoded token.")
 
+        // --- continuous-batch API ---
+
+        // Prefill a prompt into a KV-cache slot; returns the first token id.
+        .def("prefill_slot",
+             &LLMEngine::prefill_slot,
+             py::arg("prompt_ids"),
+             py::arg("slot"),
+             py::arg("temperature") = 0.0f,
+             py::arg("top_p")       = 1.0f,
+             py::arg("seed")        = 1234ULL,
+             py::call_guard<py::gil_scoped_release>(),
+             "Prefill a prompt into KV-cache slot; returns first sampled token.")
+
+        // One decode step over a batch of active sequences.
+        .def("decode_batch",
+             &LLMEngine::decode_batch,
+             py::arg("tokens"),
+             py::arg("positions"),
+             py::arg("slots"),
+             py::call_guard<py::gil_scoped_release>(),
+             "One decode step; returns the next token id for each sequence.")
+
+        .def("max_slots",
+             &LLMEngine::max_slots,
+             "Return the number of concurrent KV-cache slots.")
+
         .def("vocab_size",
              &LLMEngine::vocab_size,
              "Return the model vocabulary size (151936 for Qwen2-0.5B).");

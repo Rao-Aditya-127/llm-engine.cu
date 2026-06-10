@@ -23,7 +23,7 @@ CU_SRC         := src/infer_gpu_fp32.cu \
 CU_SRC_FP16    := src/infer_gpu_fp16.cu \
                   kernels/fp16/rmsnorm.cu  kernels/fp16/rope.cu \
                   kernels/fp16/swiglu.cu   kernels/fp16/matmul.cu \
-                  kernels/fp16/attention.cu
+                  kernels/fp16/attention.cu kernels/fp16/kv_scatter.cu
 CU_SRC_INT8    := src/infer_gpu_int8.cu \
                   kernels/fp16/rmsnorm.cu  kernels/fp16/rope.cu \
                   kernels/fp16/swiglu.cu   kernels/fp16/attention.cu \
