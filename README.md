@@ -1,361 +1,262 @@
 # llm-engine.cu
 
-A single-GPU, raw C++/CUDA inference engine for **Qwen2-0.5B** — no cuBLAS, no
-CUTLASS. Every kernel is written by hand.
+**A from-scratch CUDA/C++ inference engine for Qwen2 — hand-written kernels,
+continuous batching, and an HTTP serving layer. No cuBLAS, no cuDNN, no PyTorch in
+the hot path.**
 
-The goal is to understand *why* LLM inference is slow (memory bandwidth) and what
-actually fixes it (FP16, INT8, op fusion) — by building each optimization from
-scratch and measuring the result.
+`llm-engine.cu` runs Qwen2-family models (0.5B / 1.5B) end-to-end on a single NVIDIA
+GPU. Every operation in the forward pass — GEMMs, grouped-query attention, RMSNorm,
+RoPE, SwiGLU, and quantized matmul — is a hand-written CUDA kernel. A continuous-batching
+scheduler and a FastAPI server sit on top, so the same engine that runs from the command
+line also serves concurrent HTTP requests with token streaming.
 
-See [details.md](details.md) for an in-depth, phase-by-phase explanation of every
-design decision and concept.
-
----
-
-## Results
-
-Single-token decode throughput. Prompt: `"The capital of France is"`, 32 greedy
-tokens. All rows measured on the same cloud GPU VM (lightning.ai T4) for an
-apples-to-apples comparison.
-
-| Engine               | Hardware | tok/s  | vs HF FP16 |
-|----------------------|----------|--------|------------|
-| CPU naive (1 thread) | VM CPU   | 1.60   | 0.06×      |
-| CPU + OpenMP         | VM CPU   | 5.13   | 0.18×      |
-| GPU FP32             | VM GPU   | 112.43 | 3.89×      |
-| GPU FP16             | VM GPU   | 184.66 | **6.39×**  |
-| GPU INT8 (W8A16)     | VM GPU   | 263.04 | **9.11×**  |
-| HF transformers FP16 | VM GPU   | 28.88  | 1.00×      |
-
-Output verified token-exact against HuggingFace `transformers` for all phases
-through FP16. INT8 matches on the first token; subsequent tokens diverge due to
-known error accumulation on sub-1B models (see [details.md](details.md), Phase 4).
+The engine is built around the fact that LLM decoding is **memory-bandwidth-bound**:
+performance comes from keeping the GPU's memory system saturated and reading each weight
+as few times as possible. On an NVIDIA L4 it matches vLLM's single-stream latency and
+stays within ~1.2× of vLLM's tensor-core throughput through batch 8 — with no external
+GEMM library.
 
 ---
 
-## Competing with a Production Inference Engine — vLLM (L4)
+## Highlights
 
-The T4 comparison above uses HuggingFace as a baseline to isolate Python dispatch
-overhead. This comparison uses a production inference engine.
-
-Benchmarked on an NVIDIA L4 (compute capability 8.9) — the T4's 7.5 does not
-support Flash Attention 2, so vLLM's full stack (FA2, CUDA graphs, torch.compile)
-only runs on L4. Same model weights (Qwen2-0.5B-Instruct FP16), 200-token output.
-
-| System               | Batch |  tok/s |
-|----------------------|-------|--------|
-| llm-engine.cu (FP16) | 1     |    195 |
-| vLLM (FP16)          | 1     |    202 |
-| vLLM (FP16)          | 50    |  8,456 |
-
-> **TL;DR** — At batch=1 a hand-written CUDA engine matches a full production stack
-> because both hit the same memory bandwidth ceiling. vLLM's 44× advantage at
-> batch=50 comes from batching, not better kernels. The bottleneck was always
-> bandwidth, not software.
-
-At batch=1, a raw CUDA binary with no framework trades blows with vLLM's full
-optimization stack. The numbers look identical because vLLM's key optimizations
-simply do not apply to this workload.
-
-Flash Attention 2 speeds up attention over long sequences — at decode time there is
-only one new token per step, so there is nothing for it to optimize. cuBLAS provides
-highly tuned matrix multiplication for large batches — at batch=1 every linear layer
-reduces to a matrix-vector product, which cannot utilize tensor cores regardless of
-the library. CUDA graphs and torch.compile eliminate Python dispatch overhead — this
-engine has no Python in the hot path to begin with.
-
-Strip away everything that does not apply, and both engines are left doing the same
-work: reading the full ~990 MB of model weights from GPU memory once per token. At
-L4's ~300 GB/s bandwidth that is a hard floor of ~3 ms per token, and both engines
-are sitting on it.
-
-At batch=50, vLLM reaches 8,456 tok/s — 44× higher. The reason
-is arithmetic: every weight matrix is read from HBM once but produces 50 output
-vectors instead of one. Same memory bandwidth cost, 50× the useful work. That gap
-is not a kernel problem, it is an architecture problem — closing it requires batched
-decode, per-sequence KV cache management, and a request scheduler.
-
-### Our batching vs vLLM: throughput vs batch size (L4, 0.5B-Instruct)
-
-So we built it. The server now runs **continuous batching**: a scheduler keeps many
-sequences in flight, decodes them together in one batched GPU step, and admits new
-requests / evicts finished ones every step (one KV-cache slot per sequence). Both
-columns below are measured the same way — greedy, 200 fixed tokens, warm-up excluded.
-
-| Batch | ours tok/s | ours tok/s/seq | vLLM tok/s | vLLM tok/s/seq |
-|-------|-----------:|---------------:|-----------:|---------------:|
-| 1     | 195        | 195            | 202        | 202            |
-| 2     | 385        | 193            | 407        | 204            |
-| 4     | 753        | 188            | 813        | 203            |
-| 8     | 1,312      | 164            | 1,600      | 200            |
-| 16    | 1,732      | 108            | 3,081      | 193            |
-
-This is after two kernel changes (see below). We are now **neck-and-neck with vLLM
-through batch 4**, within 1.2× at batch 8, and within 1.8× at batch 16 — a hand-written
-CUDA engine, no library, no Python in the loop, keeping pace with a production
-tensor-core stack across most of the curve.
-
-**The two changes that got us here:**
-
-1. **A weight-reuse GEMM.** The first batched kernel assigned one warp per output
-   element and re-read the weights once *per sequence*, so HBM traffic grew with batch
-   and `tok/s/seq` collapsed (185 → 31). The fix is a tiled kernel that streams each
-   weight row from HBM **once** and reuses it across the whole batch from registers. The
-   subtlety: the per-sequence accumulators must be a **compile-time-sized** array
-   (`template <int B>`), otherwise a runtime-indexed `acc[batch]` spills to local memory
-   (DRAM) and every FMA hits DRAM — the first naive attempt was actually *slower* for
-   exactly this reason. With the batch templated and `float4` vectorized loads, batch=16
-   went 492 → 1,554 tok/s.
-2. **GPU-side argmax.** Greedy decoding was copying the full `[batch × vocab]` logits to
-   the host every step (~9.7 MB at batch=16) and arg-maxing on the CPU. Doing the argmax
-   on the GPU and copying back `batch` ints (~64 bytes) took batch=16 to 1,732 tok/s.
-
-The `tok/s/seq` column tells the story: it now declines *gently* (195 → 108) instead of
-collapsing — weight reuse is working, exactly like vLLM's flat ~200.
-
-**Where the rest of the gap lives.** A built-in profiler (`TINYLLM_PROFILE=1`) puts the
-decode step at **~80% matmul**, ~13% norm/rope, ~7% attention, ~0.5% sampling. The 80%
-is dominated by the big GEMMs (FFN at 4864 wide, the LM head at 151936) — already
-well-tiled and near the CUDA-core bandwidth ceiling. The remaining ~1.8× to vLLM at
-batch 16 is those big matmuls, and closing it needs **tensor cores** (FP16 matrix units
-do a 16×16×16 multiply per instruction with hardware weight reuse and dedicated
-accumulators). No further CUDA-core kernel tuning reaches that — which is the honest
-ceiling of a from-scratch engine, and a good place to stop.
+- **Pure hand-written CUDA/C++** — no cuBLAS, CUTLASS, cuDNN, or framework runtime in the
+  inference path. Tokenization is the only Python dependency.
+- **Three precision backends** — FP32, FP16 (with FP32 accumulation), and INT8 (W8A16),
+  selected at build time.
+- **Continuous batching** — a request scheduler with per-sequence KV-cache slots decodes
+  many sequences in a single batched GPU step, admitting and evicting sequences each step.
+- **Weight-reuse tiled GEMM** — a templated batched matmul that streams each weight from
+  HBM once and reuses it across the batch, turning decode-time GEMVs into true GEMMs.
+- **HTTP serving** — FastAPI server with blocking and Server-Sent-Events streaming
+  endpoints, a minimal web UI, and `pybind11` bindings into the C++ engine.
+- **Correctness-verified** — outputs checked token-exact against HuggingFace Transformers.
+- **Model-configurable** — `TINYLLM_MODEL` selects any Qwen2 checkpoint; weights are
+  exported to a compact single-file binary format.
 
 ---
 
-## Repository structure
+## Performance
+
+### vs. vLLM — continuous batching (NVIDIA L4, Qwen2-0.5B-Instruct, FP16)
+
+Throughput as concurrency scales. Both systems measured identically: greedy decoding,
+200 fixed output tokens, warm-up excluded.
+
+| Batch | llm-engine.cu (tok/s) | per-seq | vLLM (tok/s) | per-seq |
+|------:|----------------------:|--------:|-------------:|--------:|
+| 1     | 195                   | 195     | 202          | 202     |
+| 2     | 385                   | 193     | 407          | 204     |
+| 4     | 753                   | 188     | 813          | 203     |
+| 8     | 1,312                 | 164     | 1,600        | 200     |
+| 16    | 1,732                 | 108     | 3,081        | 193     |
+
+`llm-engine.cu` is neck-and-neck with vLLM through batch 4 and within 1.2× at batch 8 —
+a from-scratch engine keeping pace with a production tensor-core stack across most of the
+curve. The remaining gap at batch 16 is the large GEMMs, which vLLM runs on tensor cores;
+see [Performance engineering](#performance-engineering).
+
+### Precision backends (NVIDIA T4, single-sequence decode)
+
+Single-token decode throughput against HuggingFace Transformers as the baseline, same
+prompt and hardware.
+
+| Backend              | tok/s  | vs. HF FP16 |
+|----------------------|-------:|------------:|
+| HF Transformers FP16 | 28.88  | 1.00×       |
+| GPU FP32             | 112.43 | 3.89×       |
+| GPU FP16             | 184.66 | **6.39×**   |
+| GPU INT8 (W8A16)     | 263.04 | **9.11×**   |
+| CPU + OpenMP         | 5.13   | 0.18×       |
+| CPU naive            | 1.60   | 0.06×       |
+
+Output is verified token-exact against HuggingFace through FP16. The 6–9× advantage over
+HF comes from eliminating Python dispatch overhead, not from faster kernels — see
+[Performance engineering](#performance-engineering).
+
+---
+
+## Architecture
 
 ```
-tinyllm/
-│
-├── Makefile                    # Primary build — see "Building" below
-│
+llm-engine.cu/
 ├── src/
-│   ├── config.h                # Qwen2-0.5B architecture constants + binary header format
-│   ├── model.h / model.cpp     # Weight loading from .bin (FP32 / FP16 / INT8)
-│   ├── sampler.h / sampler.cpp # Greedy and top-p sampling
-│   ├── main.cpp                # CLI entry point — times the generation loop
-│   │
-│   ├── infer_cpu.h / .cpp      # Phase 1: full FP32 CPU forward pass + KV cache
-│   ├── infer_gpu_fp32.h / .cu  # Phase 2: FP32 GPU forward pass (GpuRunner)
-│   ├── infer_gpu_fp16.h / .cu  # Phase 3: FP16 GPU forward pass (GpuRunnerFP16)
-│   └── infer_gpu_int8.h / .cu  # Phase 4: INT8 W8A16 GPU forward pass (GpuRunnerInt8)
+│   ├── config.h               # Qwen2 architecture constants + binary header format
+│   ├── model.{h,cpp}          # Weight loading from the .bin blob (FP32 / FP16 / INT8)
+│   ├── sampler.{h,cpp}        # Greedy and top-p (nucleus) sampling
+│   ├── main.cpp               # CLI entry point
+│   ├── infer_cpu.{h,cpp}      # CPU reference forward pass (+ OpenMP)
+│   ├── infer_gpu_fp32.{h,cu}  # FP32 GPU runner
+│   ├── infer_gpu_fp16.{h,cu}  # FP16 GPU runner — prefill, continuous-batch decode
+│   └── infer_gpu_int8.{h,cu}  # INT8 W8A16 GPU runner
 │
-├── kernels/
-│   ├── common.cuh              # Shared CUDA_CHECK macro
-│   ├── fp32/                   # Phase 2 FP32 kernels
-│   │   ├── kernels.cuh         # Host-side launch declarations
-│   │   ├── rmsnorm.cu
-│   │   ├── rope.cu
-│   │   ├── swiglu.cu
-│   │   ├── matmul.cu           # Warp-per-row GEMV with warp-shuffle reduction
-│   │   └── attention.cu        # Causal attention + GQA (14Q / 2KV heads)
-│   ├── fp16/                   # Phase 3 FP16 kernels (FP16 storage, FP32 accumulators)
-│   │   ├── kernels.cuh
-│   │   ├── rmsnorm.cu
-│   │   ├── rope.cu
-│   │   ├── swiglu.cu
-│   │   ├── matmul.cu           # matmul_fp16_kernel + matmul_fp16_to_fp32_kernel (LM head)
-│   │   └── attention.cu
-│   └── int8/                   # Phase 4 INT8 kernels (reuses fp16/ for non-matmul ops)
-│       ├── kernels.cuh
-│       ├── matmul.cu           # Fused dequant + matmul (W8A16)
-│       └── embedding.cu        # INT8 embedding lookup with per-row dequant
+├── kernels/                   # Hand-written CUDA kernels (fp32 / fp16 / int8 variants)
+│   ├── */matmul.cu            # Warp-per-row GEMV, templated weight-reuse tiled GEMM
+│   ├── */attention.cu         # Causal GQA attention (decode + prefill)
+│   ├── */rmsnorm.cu rope.cu swiglu.cu
+│   ├── fp16/kv_scatter.cu     # Scatter K/V into per-slot, per-position cache cells
+│   └── fp16/argmax.cu         # On-GPU greedy argmax over the logits
+│
+├── server/
+│   ├── engine.{h,cpp}         # C++ engine facade (PIMPL — keeps CUDA out of bindings)
+│   ├── bindings.cpp           # pybind11 module
+│   ├── server.py              # FastAPI app + continuous-batch scheduler
+│   └── index.html             # Minimal streaming web UI
 │
 ├── tools/
-│   ├── convert.py              # Export Qwen2-0.5B weights → tinyllm.bin (fp32/fp16/int8)
-│   ├── tokenizer.py            # Encode text → token IDs; decode IDs → text
-│   ├── golden.py               # Dump golden reference logits + greedy continuation
-│   └── bench_hf.py             # HuggingFace transformers baseline benchmark
+│   ├── convert.py             # Export a Qwen2 checkpoint → tinyllm.bin
+│   ├── tokenizer.py           # Text ↔ token IDs
+│   ├── hf_check.py            # Cross-check engine output against HuggingFace
+│   ├── batch_check.py         # Verify batched decode == single-sequence decode
+│   ├── bench_batch.py         # Throughput vs. batch size
+│   └── bench_vllm.py          # vLLM baseline at matching settings
 │
-├── benchmarks/
-│   ├── golden.txt              # Human-readable golden reference output
-│   └── golden_logits.bin       # Raw FP32 logit vector from HF model (first step)
-│
-└── details.md                  # Phase-by-phase deep-dive + learning log
+├── Makefile
+└── details.md                 # Design deep-dive
 ```
+
+**Design notes.** The C++ engine is exposed to Python through a PIMPL facade so the
+binding layer compiles without `nvcc`; CUDA types stay confined to the `.cu` translation
+units. The KV cache carries a leading slot dimension (`[slots × layers × cap × kv_dim]`)
+so the scheduler can keep each in-flight sequence isolated. FP16 storage with FP32
+accumulation is used throughout the matmul and softmax paths for numerical stability.
 
 ---
 
-## Prerequisites
+## Quickstart
 
-### Python (weight export + tokenization)
+### Requirements
 
-```
-pip install torch transformers numpy
-```
+- CUDA Toolkit 11.0+ with `nvcc`, and an NVIDIA GPU. The Makefile defaults to
+  `-arch=sm_75` (T4); set it to your architecture (e.g. `sm_89` for L4/RTX 4090,
+  `sm_80` for A100).
+- A 64-bit C++ compiler for the CPU backend.
+- Python 3.8+ with `torch`, `transformers`, `numpy` for weight export and tokenization;
+  add `fastapi`, `uvicorn`, `pybind11` for the server.
 
-Python 3.8+ recommended. The model (`Qwen/Qwen2-0.5B`) downloads automatically
-from HuggingFace on first use (~1 GB).
-
-### C++ / CPU build
-
-- A 64-bit C++ compiler: `g++` (Linux/macOS) or MSVC `cl` (Windows)
-- The FP32 weight file is ~2 GB — a 32-bit process cannot address it; the build
-  **must** be 64-bit
-
-### CUDA / GPU build
-
-- CUDA Toolkit 11.0+ with `nvcc`
-- An NVIDIA GPU (Makefile defaults to `-arch=sm_75` for T4 — change it for other
-  GPUs, e.g. `sm_86` for RTX 3090, `sm_89` for RTX 4090)
-
----
-
-## Setup
-
-Run these once, in order:
+### Setup
 
 ```bash
-# 1. Export FP32 weights (~2 GB)
-python tools/convert.py --out tinyllm.bin
+pip install torch transformers numpy fastapi uvicorn pybind11
 
-# 2. Export FP16 weights (~1 GB) — needed for Phase 3
+# Select the model (default: Qwen/Qwen2-0.5B-Instruct)
+export TINYLLM_MODEL=Qwen/Qwen2-0.5B-Instruct
+
+# Export FP16 weights (~1 GB). Use --dtype fp32 / int8 for the other backends.
 python tools/convert.py --out tinyllm_fp16.bin --dtype fp16
-
-# 3. Export INT8 weights (~500 MB) — needed for Phase 4
-python tools/convert.py --out tinyllm_int8.bin --dtype int8
-
-# 4. Generate the golden reference (needs a GPU or is slow on CPU)
-python tools/golden.py
-#   writes: benchmarks/golden.txt  (human-readable)
-#           benchmarks/golden_logits.bin  (raw FP32 logits for numeric diff)
 ```
 
----
-
-## Building
+### Build
 
 ```bash
-make            # CPU binaries (naive + OpenMP)  — uses g++
-make gpu        # GPU FP32 binary               — uses nvcc, needs CUDA + NVIDIA GPU
-make gpu_fp16   # GPU FP16 binary
-make gpu_int8   # GPU INT8 W8A16 binary
-make clean      # remove build/
+make gpu_fp16     # FP16 GPU binary
+make gpu_int8     # INT8 W8A16 GPU binary
+make gpu          # FP32 GPU binary
+make              # CPU binaries (naive + OpenMP)
+make server       # pybind11 shared library for the FastAPI server
 ```
 
-> **Windows without `make`:** compile the four `src/*.cpp` files with 64-bit MSVC
-> `cl` and add `/openmp` for the OpenMP build. For CUDA builds, `nvcc` is
-> cross-platform — the Makefile commands translate directly.
-
-All built binaries land in `build/`.
-
----
-
-## Running
-
-### Tokenize your prompt
+### Run — CLI
 
 ```bash
 python tools/tokenizer.py encode "The capital of France is"
-# output: 785 6722 315 9625 374
-```
+#   → 785 6722 315 9625 374
 
-### Run the engine
-
-```bash
-# CPU naive (single thread)
-./build/tinyllm_naive tinyllm.bin --ids "785 6722 315 9625 374" --max-new 32
-
-# CPU with OpenMP
-./build/tinyllm_omp tinyllm.bin --ids "785 6722 315 9625 374" --max-new 32
-
-# GPU FP32
-./build/tinyllm_gpu tinyllm.bin --ids "785 6722 315 9625 374" --max-new 32
-
-# GPU FP16
 ./build/tinyllm_gpu_fp16 tinyllm_fp16.bin --ids "785 6722 315 9625 374" --max-new 32
+#   prints generated token IDs to stdout, tok/s to stderr
 
-# GPU INT8 W8A16
-./build/tinyllm_gpu_int8 tinyllm_int8.bin --ids "785 6722 315 9625 374" --max-new 32
+python tools/tokenizer.py decode 12095 13 1084 374 279 7772 3283
+#   → " Paris. It is the largest city..."
 ```
-
-Each binary prints generated token IDs to stdout and `tok/s` to stderr.
-
-### Decode the output
-
-```bash
-python tools/tokenizer.py decode 12095 13 1084 374 279 7772 3283 ...
-# output: " Paris. It is the largest city..."
-```
-
-### CLI flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ids "..."` | required | Space-separated prompt token IDs |
-| `--max-new N` | 32 | Number of tokens to generate |
+| `--max-new N` | 32 | Tokens to generate |
 | `--temp T` | 0.0 | Sampling temperature (0 = greedy) |
 | `--top-p P` | 0.9 | Nucleus sampling threshold |
-| `--seed S` | 42 | RNG seed for reproducible sampling |
-| `--dump-logits PATH` | — | Write first-step logits to a binary file |
+| `--seed S` | 42 | RNG seed |
+| `--dump-logits PATH` | — | Write first-step logits for numeric verification |
+
+### Run — server
+
+```bash
+make server
+uvicorn server.server:app --host 0.0.0.0 --port 8000
+```
+
+Open `http://<host>:8000` for the web UI, or call the API directly:
+
+```bash
+# Blocking
+curl -s -X POST localhost:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain gravity in one sentence","max_tokens":64}'
+
+# Streaming (Server-Sent Events)
+curl -N -X POST localhost:8000/generate/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain gravity in one sentence","max_tokens":64}'
+```
+
+The server runs a single engine-owning worker thread behind a continuous-batch scheduler:
+concurrent requests are admitted into free KV-cache slots, decoded together each step, and
+evicted on EOS or length limit.
 
 ---
 
-## Roofline analysis
+## Performance engineering
 
-T4 peak DRAM bandwidth: **~320 GB/s**.
-Profiled with `ncu --set basic --kernel-name matmul_fp16_kernel`:
+LLM decode reads the entire weight set from HBM for every token, so the relevant metric is
+bytes moved, not FLOPs. Three design decisions follow directly from that.
 
-| Matmul shape        | Used for              | DRAM utilization      |
-|---------------------|-----------------------|-----------------------|
-| `[4864 × 896]` × 24 | FFN gate / up / down  | **90.5% (~290 GB/s)** |
-| `[896 × 896]` × 24  | Q / O projections     | 57.7% (~185 GB/s)     |
-| `[128 × 896]` × 24  | K / V projections     | 15.6% (~50 GB/s)      |
+**Decode is memory-bandwidth-bound.** At FP16 the model is ~990 MB; at the T4's 320 GB/s
+that is a ~3 ms/token floor, capping single-stream throughput near ~320 tok/s regardless
+of kernel cleverness. INT8 (W8A16) halves the bytes per weight and lifts decode to 263
+tok/s — 82% of that ceiling. A roofline check (`ncu`) puts the large FFN GEMMs at **90.5%
+of peak DRAM bandwidth**, confirming the matmuls are bandwidth-limited rather than
+compute-limited.
 
-The large FFN matmuls are at the memory-bandwidth roof. Arithmetic intensity for a
-matrix-vector product is `~1 FLOP/byte` — the T4's FP16 compute roof (~65 TFLOPS)
-is 200× higher, so **compute never becomes the bottleneck in single-token decode**.
+**Batching only pays off with weight reuse.** Adding sequences to a batch is free in
+bandwidth terms *only if* each weight is read once and reused across the batch. The first
+batched matmul read the weights once per sequence, so per-sequence throughput collapsed as
+the batch grew. The fix is a tiled kernel that streams each weight row from HBM once and
+accumulates across the batch from registers — but the per-sequence accumulators must be a
+**compile-time-sized** array (`template <int B>`); a runtime-indexed `acc[batch]` spills to
+local memory (DRAM) and turns every multiply-add into a DRAM round-trip. Templating the
+batch and using `float4` vectorized loads took batch-16 throughput from 492 to 1,554 tok/s.
 
-FP16 → INT8 halves the bytes read per weight; the FFN matmul stays near 90% of
-the (now INT8) roof, giving a 1.42× system-level speedup. The gap from the
-theoretical 2× is the ~22% of GPU time in non-matmul kernels (RMSNorm, RoPE,
-attention, SwiGLU) that are unchanged between precisions.
+**Keep the decode loop on the GPU.** Greedy decoding originally copied the full
+`[batch × vocab]` logits to the host each step (~9.7 MB at batch 16) for a CPU argmax. Doing
+the argmax on the GPU and returning `batch` integers (~64 bytes) lifted batch-16 throughput
+to 1,732 tok/s. A built-in profiler (`TINYLLM_PROFILE=1`) then attributes the decode step to
+**~80% matmul, ~13% norm/RoPE, ~7% attention, ~0.5% sampling** — the large GEMMs dominate
+and are at the CUDA-core bandwidth ceiling.
 
----
-
-## Why we beat HuggingFace by 6–9×
-
-HF `transformers` uses cuBLAS — a best-in-class GEMM library. The individual
-kernels are fast. The bottleneck is **Python dispatch overhead**: each decode step
-calls ~120+ separate Python-dispatched torch ops (one per projection, one per norm,
-one for `apply_rotary_pos_emb`, etc.). At batch size 1, each CUDA kernel finishes
-in tens of microseconds, then Python spends a similar amount re-entering the
-dispatcher for the next op.
-
-Our engine runs a single C++ `forward()` call per token; from there it is one
-CUDA kernel after another on the default stream with zero Python in the loop.
-**We win on the host-side cost path, not kernel speed.**
-
-This is also why `torch.compile` and CUDA graphs exist in PyTorch 2.0+ — they
-amortize or eliminate that dispatch overhead and close most of the gap.
+**Why this beats HuggingFace by 6–9× at batch 1.** HF Transformers calls cuBLAS — fast
+kernels — but dispatches 120+ separate Python-level ops per decode step; at batch 1 each
+kernel runs in tens of microseconds and Python spends a comparable amount re-entering the
+dispatcher. This engine runs one C++ `forward()` per token with zero Python in the loop, so
+the win is on the host cost path, not raw kernel speed. (This is the same overhead
+`torch.compile` and CUDA graphs exist to remove.)
 
 ---
 
-## What I learned
+## Limitations & roadmap
 
-**1. Decode is memory-bandwidth-bound.**
-Each token reads every weight once (~990 MB at FP16). At T4's 320 GB/s that is
-~3 ms/token, capping throughput at ~320 tok/s. We reach 263 tok/s at INT8 —
-82% of the theoretical ceiling.
+- **Tensor cores.** The remaining gap to vLLM at high batch is the large GEMMs, which vLLM
+  runs on FP16 tensor cores (a 16×16×16 multiply per instruction with hardware weight reuse).
+  A `wmma`/`mma` GEMM is the path to closing it; the current kernels are CUDA-core only.
+- **INT8 on small models.** The W8A16 kernel is correct (first-token argmax matches HF), but
+  per-row symmetric quantization accumulates error through the 24-layer stack on sub-1B
+  models and the sequence diverges after a few tokens. Calibrated schemes (GPTQ/AWQ) sit on
+  the same W8A16 skeleton and fix this; continuous batching currently targets the FP16 path.
+- **Long context.** Attention is a standard causal/GQA kernel; FlashAttention-style tiling
+  would matter only at long sequence lengths, which are out of scope for the current targets.
 
-**2. Halving the bytes roughly doubles the speed.**
-FP32 → FP16: measured 1.64× (theory: 2×; gap = non-matmul ops + launch overhead).
-FP16 → INT8: measured 1.42× (same gap). Inside the big FFN matmul the bandwidth
-win is close to 2× both times.
+---
 
-**3. Naive INT8 breaks on small models.**
-The kernel is correct — the first-step argmax matches HuggingFace. But per-row
-symmetric INT8 error accumulates through the 24-layer KV cache and the sequence
-diverges at token 3. The same scheme works on 7B+ models. The fix (GPTQ, AWQ,
-bitsandbytes) is calibration on top of the same W8A16 skeleton built here.
+## Further reading
 
-**4. Op fusion eliminates memory round-trips.**
-SwiGLU fused `silu(gate) * up` avoids writing and re-reading a 4864-element
-intermediate buffer every layer. Small win per layer, but free to get right.
-
-**5. Python dispatch is the real enemy above raw kernel speed.**
-HF's cuBLAS kernels are faster than the hand-written warp-per-row GEMV, yet this
-engine is 6× faster end-to-end. The lesson: in production, the overhead layer
-matters as much as the kernel.
+[details.md](details.md) — a design deep-dive covering the binary weight format, the KV-cache
+layout, the quantization scheme, and the kernel-by-kernel rationale.
