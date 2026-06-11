@@ -73,8 +73,36 @@ At batch=50, vLLM reaches 8,456 tok/s — 44× higher. The reason
 is arithmetic: every weight matrix is read from HBM once but produces 50 output
 vectors instead of one. Same memory bandwidth cost, 50× the useful work. That gap
 is not a kernel problem, it is an architecture problem — closing it requires batched
-decode, per-sequence KV cache management, and a request scheduler. That is the
-natural next step for this engine.
+decode, per-sequence KV cache management, and a request scheduler.
+
+### Our batching vs vLLM: throughput vs batch size (L4, 0.5B-Instruct)
+
+So we built it. The server now runs **continuous batching**: a scheduler keeps many
+sequences in flight, decodes them together in one batched GPU step, and admits new
+requests / evicts finished ones every step (one KV-cache slot per sequence). Both
+columns below are measured the same way — greedy, 200 fixed tokens, warm-up excluded.
+
+| Batch | ours tok/s | ours tok/s/seq | vLLM tok/s | vLLM tok/s/seq |
+|-------|-----------:|---------------:|-----------:|---------------:|
+| 1     | 185        | 185            | 202        | 202            |
+| 2     | 287        | 143            | 407        | 204            |
+| 4     | 376        | 94             | 813        | 203            |
+| 8     | 449        | 56             | 1,600      | 200            |
+| 16    | 492        | 31             | 3,081      | 193            |
+
+At batch=1 the two are neck and neck. The whole story is in the **tok/s/seq** column:
+vLLM stays flat at ~200 tok/s per sequence at every batch size — adding sequences is
+almost free. Ours collapses from 185 to 31. That is the signature of weight reuse.
+vLLM's tiled GEMM reads each weight tile from HBM **once** and reuses it across the
+whole batch, so it stays bandwidth-efficient as the batch grows. Our `matmul_batched`
+assigns one warp per output element and **re-reads the weights for every sequence**, so
+the only thing batching buys us is higher GPU occupancy (more warps hiding latency),
+not fewer bytes read.
+
+The architecture — scheduler, per-sequence KV cache, batched decode — is in place and
+gives a real 2.7× aggregate gain (185 → 492 tok/s). The remaining 6.3× gap at batch=16
+(492 vs 3,081) is one specific kernel: a tiled GEMM with shared-memory weight reuse.
+That is the next optimization, and this table measures exactly what it is worth.
 
 ---
 
