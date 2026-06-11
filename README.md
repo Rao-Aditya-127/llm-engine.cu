@@ -44,8 +44,8 @@ only runs on L4. Same model weights (Qwen2-0.5B-Instruct FP16), 200-token output
 
 | System               | Batch |  tok/s |
 |----------------------|-------|--------|
-| llm-engine.cu (FP16) | 1     |    190 |
-| vLLM (FP16)          | 1     |    185 |
+| llm-engine.cu (FP16) | 1     |    195 |
+| vLLM (FP16)          | 1     |    202 |
 | vLLM (FP16)          | 50    |  8,456 |
 
 > **TL;DR** — At batch=1 a hand-written CUDA engine matches a full production stack
@@ -84,25 +84,43 @@ columns below are measured the same way — greedy, 200 fixed tokens, warm-up ex
 
 | Batch | ours tok/s | ours tok/s/seq | vLLM tok/s | vLLM tok/s/seq |
 |-------|-----------:|---------------:|-----------:|---------------:|
-| 1     | 185        | 185            | 202        | 202            |
-| 2     | 287        | 143            | 407        | 204            |
-| 4     | 376        | 94             | 813        | 203            |
-| 8     | 449        | 56             | 1,600      | 200            |
-| 16    | 492        | 31             | 3,081      | 193            |
+| 1     | 195        | 195            | 202        | 202            |
+| 2     | 385        | 193            | 407        | 204            |
+| 4     | 753        | 188            | 813        | 203            |
+| 8     | 1,312      | 164            | 1,600      | 200            |
+| 16    | 1,732      | 108            | 3,081      | 193            |
 
-At batch=1 the two are neck and neck. The whole story is in the **tok/s/seq** column:
-vLLM stays flat at ~200 tok/s per sequence at every batch size — adding sequences is
-almost free. Ours collapses from 185 to 31. That is the signature of weight reuse.
-vLLM's tiled GEMM reads each weight tile from HBM **once** and reuses it across the
-whole batch, so it stays bandwidth-efficient as the batch grows. Our `matmul_batched`
-assigns one warp per output element and **re-reads the weights for every sequence**, so
-the only thing batching buys us is higher GPU occupancy (more warps hiding latency),
-not fewer bytes read.
+This is after two kernel changes (see below). We are now **neck-and-neck with vLLM
+through batch 4**, within 1.2× at batch 8, and within 1.8× at batch 16 — a hand-written
+CUDA engine, no library, no Python in the loop, keeping pace with a production
+tensor-core stack across most of the curve.
 
-The architecture — scheduler, per-sequence KV cache, batched decode — is in place and
-gives a real 2.7× aggregate gain (185 → 492 tok/s). The remaining 6.3× gap at batch=16
-(492 vs 3,081) is one specific kernel: a tiled GEMM with shared-memory weight reuse.
-That is the next optimization, and this table measures exactly what it is worth.
+**The two changes that got us here:**
+
+1. **A weight-reuse GEMM.** The first batched kernel assigned one warp per output
+   element and re-read the weights once *per sequence*, so HBM traffic grew with batch
+   and `tok/s/seq` collapsed (185 → 31). The fix is a tiled kernel that streams each
+   weight row from HBM **once** and reuses it across the whole batch from registers. The
+   subtlety: the per-sequence accumulators must be a **compile-time-sized** array
+   (`template <int B>`), otherwise a runtime-indexed `acc[batch]` spills to local memory
+   (DRAM) and every FMA hits DRAM — the first naive attempt was actually *slower* for
+   exactly this reason. With the batch templated and `float4` vectorized loads, batch=16
+   went 492 → 1,554 tok/s.
+2. **GPU-side argmax.** Greedy decoding was copying the full `[batch × vocab]` logits to
+   the host every step (~9.7 MB at batch=16) and arg-maxing on the CPU. Doing the argmax
+   on the GPU and copying back `batch` ints (~64 bytes) took batch=16 to 1,732 tok/s.
+
+The `tok/s/seq` column tells the story: it now declines *gently* (195 → 108) instead of
+collapsing — weight reuse is working, exactly like vLLM's flat ~200.
+
+**Where the rest of the gap lives.** A built-in profiler (`TINYLLM_PROFILE=1`) puts the
+decode step at **~80% matmul**, ~13% norm/rope, ~7% attention, ~0.5% sampling. The 80%
+is dominated by the big GEMMs (FFN at 4864 wide, the LM head at 151936) — already
+well-tiled and near the CUDA-core bandwidth ceiling. The remaining ~1.8× to vLLM at
+batch 16 is those big matmuls, and closing it needs **tensor cores** (FP16 matrix units
+do a 16×16×16 multiply per instruction with hardware weight reuse and dedicated
+accumulators). No further CUDA-core kernel tuning reaches that — which is the honest
+ceiling of a from-scratch engine, and a good place to stop.
 
 ---
 
