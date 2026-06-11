@@ -51,6 +51,10 @@ void attention_prefill_fp16_cuda(__half* out, const __half* q,
                                  int seq_len, int n_heads, int n_kv_heads,
                                  int head_dim);
 
+// Greedy argmax per row of logits[batch × vocab] -> out[batch] (token ids).
+// Lowest index on ties, matching the host greedy sampler.
+void argmax_rows_fp32_cuda(int* out, const float* logits, int batch, int vocab);
+
 // ---------------------------------------------------------------------------
 // Continuous-batch decode variants. Each of `batch` rows is one sequence at its
 // own position in its own KV-cache slot. positions[] and slots[] are device

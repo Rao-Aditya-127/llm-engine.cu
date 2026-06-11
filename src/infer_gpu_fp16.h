@@ -91,6 +91,11 @@ private:
     float* d_logits_ = nullptr;
     std::vector<float> logits_;
 
+    // GPU greedy-argmax results — avoids copying [batch × vocab] logits to the
+    // host every decode step when all active sequences are greedy.
+    int*             d_argmax_ = nullptr;   // [max_slots]
+    std::vector<int> h_argmax_;
+
     // Shared body for prefill() and prefill_slot(): runs the batched-GEMM
     // prompt pass into the given slot and returns host logits for the last token.
     const float* run_prefill(const int* ids, int seq_len, int slot);

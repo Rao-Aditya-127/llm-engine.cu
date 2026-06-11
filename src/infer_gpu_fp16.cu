@@ -101,8 +101,10 @@ GpuRunnerFP16::GpuRunnerFP16(const Model& model, int max_slots) {
     CUDA_CHECK(cudaMalloc(&d_vtmp_, (size_t)max_slots_ * KV * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&d_pos_,  (size_t)max_slots_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_slot_, (size_t)max_slots_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_argmax_, (size_t)max_slots_ * sizeof(int)));
 
     logits_.resize((size_t)max_slots_ * vocab_);
+    h_argmax_.resize(max_slots_);
 }
 
 GpuRunnerFP16::~GpuRunnerFP16() {
@@ -111,6 +113,7 @@ GpuRunnerFP16::~GpuRunnerFP16() {
     cudaFree(d_x_); cudaFree(d_xn_); cudaFree(d_q_); cudaFree(d_attn_);
     cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_logits_); cudaFree(d_ids_);
     cudaFree(d_ktmp_); cudaFree(d_vtmp_); cudaFree(d_pos_); cudaFree(d_slot_);
+    cudaFree(d_argmax_);
 }
 
 const float* GpuRunnerFP16::forward(int token_id, int pos) {
@@ -377,18 +380,35 @@ std::vector<int> GpuRunnerFP16::decode_batch(const int* tokens,
                                      asHalf(d_xn_), batch, vocab_, H);
 
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpy(logits_.data(), d_logits_,
-                          (size_t)batch * vocab_ * sizeof(float),
-                          cudaMemcpyDeviceToHost));
 
-    // Sample one token per row using that slot's stored sampling config.
     std::vector<int> out(batch);
-    for (int b = 0; b < batch; ++b) {
-        SlotSampling& sc = slot_cfg_[slots[b]];
-        RunConfig cfg;
-        cfg.temperature = sc.temperature;
-        cfg.top_p       = sc.top_p;
-        out[b] = sample(logits_.data() + (size_t)b * vocab_, vocab_, cfg, sc.rng);
+
+    // Fast path: if every active sequence is greedy, argmax on the GPU and copy
+    // back `batch` ints instead of the full [batch × vocab] logits (≈9.7 MB at
+    // batch=16). Greedy doesn't touch the RNG, so slot state is unaffected.
+    bool all_greedy = true;
+    for (int b = 0; b < batch; ++b)
+        if (slot_cfg_[slots[b]].temperature > 0.0f) { all_greedy = false; break; }
+
+    if (all_greedy) {
+        argmax_rows_fp32_cuda(d_argmax_, d_logits_, batch, vocab_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(h_argmax_.data(), d_argmax_,
+                              (size_t)batch * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        for (int b = 0; b < batch; ++b) out[b] = h_argmax_[b];
+    } else {
+        // Sampling path: bring logits to the host and sample per row.
+        CUDA_CHECK(cudaMemcpy(logits_.data(), d_logits_,
+                              (size_t)batch * vocab_ * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (int b = 0; b < batch; ++b) {
+            SlotSampling& sc = slot_cfg_[slots[b]];
+            RunConfig cfg;
+            cfg.temperature = sc.temperature;
+            cfg.top_p       = sc.top_p;
+            out[b] = sample(logits_.data() + (size_t)b * vocab_, vocab_, cfg, sc.rng);
+        }
     }
     return out;
 }
