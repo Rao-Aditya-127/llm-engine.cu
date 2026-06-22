@@ -16,6 +16,17 @@ as few times as possible. On an NVIDIA L4 it matches vLLM's single-stream latenc
 stays within ~1.2× of vLLM's tensor-core throughput through batch 8 — with no external
 GEMM library.
 
+## Model architecture
+
+The reference model is **Qwen2-0.5B**: 24 decoder layers, hidden size 896, grouped-query
+attention (14 query heads / 2 KV heads), RoPE position encoding, RMSNorm, and a SwiGLU MLP
+(intermediate size 4864), with the embedding matrix tied to the LM head. Every block below
+is implemented as a hand-written CUDA kernel.
+
+<p align="center">
+  <img src="assets/Qwen2-0.5B%20arch.png" alt="Qwen2-0.5B architecture" width="720">
+</p>
+
 ---
 
 ## Highlights
